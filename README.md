@@ -106,8 +106,12 @@ Chat Memo 是一个非常优秀的折中产品。它把浏览器插件能做到�
 3. 当前 CLI 能力：
    - 终端连续对话
    - OpenAI-compatible 与 Gemini 的流式响应（边显示边写入）
-   - 用户输入按 Markdown 引用块（`>`）写入，AI 回复作为主体正文
+   - 用户输入默认折叠保存（`<details>`），AI 回复作为主体正文
+   - 支持 Typora 兼容回退（`SHADOWWRITE_USER_INPUT_MODE=blockquote`）
+   - 时间默认可隐藏，仍保留可索引元数据
    - 每轮对话自动追加到本地 Markdown（默认 `novel_draft.md`）
+   - 可选同步输出聊天风格 HTML 视图（默认 `novel_draft.chat.html`）
+   - HTML 视图支持助手 Markdown 渲染（CDN 可用时）
    - 支持手动结构化命令：`/section`、`/note`
    - 支持快照命令：`/snapshot`
    - 适配 `openai_compat` 与 `gemini` 两种接口层
