@@ -544,11 +544,6 @@ def format_turn_anchor(turn_id: int) -> str:
     return f"sw-turn-{turn_id}"
 
 
-def metadata_comment(role: str, stamp: str, section: str, turn_id: int) -> str:
-    section_part = f' section="{section}"' if section else ""
-    return f'<!-- sw: turn="{turn_id}" role="{role}" ts="{stamp}"{section_part} -->'
-
-
 def format_turn_tooltip(role: str, stamp: str, section: str) -> str:
     normalized = role.strip().lower()
     if normalized in {"user", "user input"}:
@@ -568,13 +563,11 @@ def format_turn_link(
     stamp: str,
     section: str,
     show_timestamp: bool,
-    anchor_id: str | None = None,
 ) -> str:
     label = format_turn_summary(role, stamp, section, show_timestamp)
     tooltip = format_turn_tooltip(role, stamp, section)
     safe_label = label.replace("[", r"\[").replace("]", r"\]")
-    target = f"#{anchor_id}" if anchor_id else "#"
-    return f'[{safe_label}]({target} "{tooltip}")'
+    return f'[{safe_label}](# "{tooltip}")'
 
 
 def format_details_body_text(text: str) -> str:
@@ -589,7 +582,9 @@ def detect_next_turn_id(path: Path) -> int:
     if not path.exists():
         return 1
     text = path.read_text(encoding="utf-8", errors="ignore")
-    hits = re.findall(r'<!--\s*sw:\s*turn="(\d+)"', text)
+    comment_hits = re.findall(r'<!--\s*sw:\s*turn="(\d+)"', text)
+    id_hits = re.findall(r'id="sw-turn-(\d+)"', text)
+    hits = [*comment_hits, *id_hits]
     if not hits:
         return 1
     return max(int(x) for x in hits) + 1
@@ -1047,32 +1042,24 @@ def append_user_turn(
     section: str,
     show_timestamp: bool,
     mode: str,
-    turn_id: int,
 ) -> None:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    anchor_id = format_turn_anchor(turn_id)
     summary = format_turn_summary("User Input", stamp, section, show_timestamp)
-    summary_link = format_turn_link(
-        "User Input", stamp, section, show_timestamp, anchor_id=anchor_id
-    )
+    summary_link = format_turn_link("User Input", stamp, section, show_timestamp)
     tooltip = format_turn_tooltip("User Input", stamp, section)
-    comment = metadata_comment("user", stamp, section, turn_id)
-    anchor = f'<a id="{anchor_id}"></a>'
 
     if mode == "blockquote":
         block = (
-            f"\n\n{comment}\n"
-            f"{anchor}\n"
+            "\n\n"
             f"{summary_link}\n\n"
             f"{quote_markdown(text)}\n"
         )
     else:
         details_body = format_details_body_text(text)
         block = (
-            f"\n\n{comment}\n"
-            f"{anchor}\n"
+            "\n\n"
             "<details class=\"sw-user-turn\"><summary>"
-            f"<strong><a href=\"#{anchor_id}\" title=\"{html_escape(tooltip)}\">{html_escape(summary)}</a></strong>"
+            f"<strong><a href=\"#\" title=\"{html_escape(tooltip)}\">{html_escape(summary)}</a></strong>"
             f"</summary>{details_body}</details>\n"
         )
 
@@ -1103,19 +1090,12 @@ def open_assistant_block(
     path: Path,
     section: str,
     show_timestamp: bool,
-    turn_id: int,
 ) -> Iterator[TextIO]:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    anchor_id = format_turn_anchor(turn_id)
-    summary_link = format_turn_link(
-        "Assistant", stamp, section, show_timestamp, anchor_id=anchor_id
-    )
-    comment = metadata_comment("assistant", stamp, section, turn_id)
-    anchor = f'<a id="{anchor_id}"></a>'
+    summary_link = format_turn_link("Assistant", stamp, section, show_timestamp)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(
-            f"\n\n{comment}\n"
-            f"{anchor}\n"
+            "\n\n"
             f"{summary_link}\n\n"
         )
         yield fh
@@ -1216,9 +1196,28 @@ def print_help(startup: bool = False) -> None:
     print("  /system <text>     Set/replace system prompt for next turns")
     print("  /section <name>    Set section tag (example: /section Plot)")
     print("  /section           Clear current section tag")
+    print("  /ml                Multi-line user input mode (end with /end)")
     print("  /note <markdown>   Append a manual note line to Markdown")
     print("  /snapshot [path]   Save current in-memory conversation snapshot")
     print("  /exit              Exit")
+
+
+def read_multiline_input() -> str:
+    print("Multi-line mode: type /end on a new line to submit, /cancel to abort.")
+    lines: List[str] = []
+    while True:
+        try:
+            line = input("... ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nMulti-line input cancelled.")
+            return ""
+        command = line.strip()
+        if command == "/cancel":
+            print("Multi-line input cancelled.")
+            return ""
+        if command == "/end":
+            return "\n".join(lines).rstrip("\n")
+        lines.append(line)
 
 
 def apply_system_prompt(history: List[Message], prompt: str) -> None:
@@ -1236,7 +1235,9 @@ def run_chat(config: AppConfig) -> int:
     ensure_output_file(config.output_path, config)
     if config.chat_html:
         ensure_chat_html_file(config.chat_html_path, config)
-    next_turn_id = detect_next_turn_id(config.output_path)
+    next_turn_id = (
+        detect_next_turn_id(config.chat_html_path) if config.chat_html else 1
+    )
 
     history: List[Message] = []
     if config.system_prompt:
@@ -1266,17 +1267,24 @@ def run_chat(config: AppConfig) -> int:
 
         if not user_text:
             continue
+        multiline_mode = False
+        if user_text in {"/ml", "/multi"}:
+            multiline_text = read_multiline_input()
+            if not multiline_text:
+                continue
+            user_text = multiline_text
+            multiline_mode = True
         if user_text in {"/exit", "/quit"}:
             print("Exiting.")
             return 0
-        if user_text == "/help":
+        if user_text == "/help" and not multiline_mode:
             print_help()
             continue
-        if user_text == "/clear":
+        if user_text == "/clear" and not multiline_mode:
             history = history[:1] if history and history[0]["role"] == "system" else []
             print("In-memory history cleared.")
             continue
-        if user_text.startswith("/system"):
+        if user_text.startswith("/system") and not multiline_mode:
             new_prompt = user_text[len("/system") :].strip()
             apply_system_prompt(history, new_prompt)
             if new_prompt:
@@ -1284,7 +1292,7 @@ def run_chat(config: AppConfig) -> int:
             else:
                 print("System prompt removed.")
             continue
-        if user_text.startswith("/section"):
+        if user_text.startswith("/section") and not multiline_mode:
             new_section = user_text[len("/section") :].strip()
             current_section = new_section
             if new_section:
@@ -1295,7 +1303,7 @@ def run_chat(config: AppConfig) -> int:
             else:
                 print("Section cleared.")
             continue
-        if user_text.startswith("/note"):
+        if user_text.startswith("/note") and not multiline_mode:
             note = user_text[len("/note") :].strip()
             if not note:
                 print("Usage: /note <markdown>")
@@ -1305,7 +1313,7 @@ def run_chat(config: AppConfig) -> int:
                 append_chat_note(config.chat_html_path, note)
             print("Note appended.")
             continue
-        if user_text.startswith("/snapshot"):
+        if user_text.startswith("/snapshot") and not multiline_mode:
             target = user_text[len("/snapshot") :].strip()
             snapshot_path = write_snapshot(
                 output_path=config.output_path,
@@ -1317,17 +1325,16 @@ def run_chat(config: AppConfig) -> int:
             print(f"Snapshot saved: {snapshot_path}")
             continue
 
-        user_turn_id = next_turn_id
-        next_turn_id += 1
         append_user_turn(
             config.output_path,
             user_text,
             current_section,
             config.show_timestamp,
             config.user_input_mode,
-            user_turn_id,
         )
         if config.chat_html:
+            user_turn_id = next_turn_id
+            next_turn_id += 1
             append_chat_user_turn(
                 config.chat_html_path,
                 user_text,
@@ -1339,8 +1346,10 @@ def run_chat(config: AppConfig) -> int:
         answer_parts: List[str] = []
         print("\nAI> ", end="", flush=True)
         try:
-            assistant_turn_id = next_turn_id
-            next_turn_id += 1
+            assistant_turn_id = None
+            if config.chat_html:
+                assistant_turn_id = next_turn_id
+                next_turn_id += 1
             html_ctx = (
                 open_assistant_chat_block(
                     config.chat_html_path,
@@ -1354,7 +1363,6 @@ def run_chat(config: AppConfig) -> int:
                 config.output_path,
                 current_section,
                 config.show_timestamp,
-                assistant_turn_id,
             ) as writer, html_ctx as html_writer:
                 for chunk in stream_model(config, history):
                     if not chunk:
