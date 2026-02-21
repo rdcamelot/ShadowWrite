@@ -9,3 +9,5 @@ test/
 .env
 
 outputs/
+
+CHAT_MEMO_ANALYSIS.md

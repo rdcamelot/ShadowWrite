@@ -91,7 +91,27 @@ Chat Memo 是一个非常优秀的折中产品。它把浏览器插件能做到�
 
 ---
 
-## 4. 当前项目进展（2026-02-20）
+## 适用环境
+
+ShadowWrite 的核心理念是**将 AI 对话实时持久化到本地文件**。这个理念不仅适用于自建 CLI，
+也适用于各类 AI 编程助手 / 对话插件的使用场景：
+
+| 环境 | 说明 |
+|------|------|
+| **ShadowWrite CLI** | 本项目的主力方案，终端对话 → 本地 .md/.html |
+| **VS Code + Copilot / Codex** | Copilot Chat 的对话历史不持久化到文件，可借助 ShadowWrite 的 Context File 机制维护项目上下文 |
+| **VS Code + Claude (Cline / Continue)** | 同理，会话窗口关闭后上下文丢失，Context File 可作为跨会话记忆补充 |
+| **VS Code + 其他 AI 插件** | 任何支持自定义 system prompt 的工具都可以手动加载 context.md 内容 |
+| **浏览器 + Chrome 扩展（方案 3）** | 直接在网页端对话，通过扩展穿透到本地文件 |
+
+> **关键洞察**：即使不使用 ShadowWrite CLI，仅使用 `context.md`（上下文记忆文件）
+> 也能为任何 AI 工具提供跨会话的项目记忆。你可以手动将 context.md 的内容
+> 粘贴到 Copilot / Claude 的对话开头，或者通过 `.github/copilot-instructions.md`
+> 等机制自动注入。
+
+---
+
+## 4. 当前项目进展（2026-02-21）
 
 ### 已完成
 
@@ -99,50 +119,78 @@ Chat Memo 是一个非常优秀的折中产品。它把浏览器插件能做到�
    - `external/chatgpt-exporter`
    - `external/markdownload`
    - `external/turndown`
-2. 已实现“方案 2”的本地可运行 MVP（无第三方依赖）：
+2. 已获取并分析 Chat Memo 扩展源码（`test/` 目录）：
+   - 多平台适配器架构（`BasePlatformAdapter` + 子类：ChatGPT/DeepSeek/Gemini/Claude/Kimi 等）
+   - `MutationObserver` + debounce 增量监听机制
+   - 锚点匹配算法处理懒加载场景
+3. 已实现"方案 2"的本地可运行 MVP（无第三方依赖）：
    - `shadowwrite_cli.py`
    - `.env.example`
    - `LOCAL_API_WORKFLOW.md`
-3. 当前 CLI 能力：
+4. 当前 CLI 能力：
    - 终端连续对话
    - OpenAI-compatible 与 Gemini 的流式响应（边显示边写入）
    - 用户输入默认折叠保存（`<details>`），AI 回复作为主体正文
    - 支持 Typora 兼容回退（`SHADOWWRITE_USER_INPUT_MODE=blockquote`）
-   - 时间默认可隐藏，仍保留可索引元数据
+   - 时间默认可隐藏，仍保留可索引元数据（`<!-- sw: turn="N" ... -->`）
+   - 每轮对话带 turn ID 锚点（`<a id="sw-turn-N"></a>`），支持文档内跳转
+   - 轮次之间以 `---` 分隔线分割，便于视觉区分
    - 每轮对话自动追加到本地 Markdown（默认 `novel_draft.md`）
    - 可选同步输出聊天风格 HTML 视图（默认 `novel_draft.chat.html`）
    - HTML 视图支持助手 Markdown 渲染（CDN 可用时）
    - 支持手动结构化命令：`/section`、`/note`
    - 支持快照命令：`/snapshot`
+   - 上下文记忆文件：`--context-file`，AI 自动维护 + 用户可审阅（见 §6）
+   - 记录与上下文独立开关：`--no-record` 可仅聊天不保存文件，`--context-file` 可独立启用
    - 适配 `openai_compat` 与 `gemini` 两种接口层
 
 ### 方案 2 后续功能优先级（更新）
 
 #### P0（已完成）
 
-- **流式输出 + 流式写入 `.md`**
-  - 必要性：高。它直接决定“沉浸感”，让右侧文档像“实时打字”。
-  - 对目标贴合度：显著提升。
+- **流式输出 + 流式写入 `.md` / `.chat.html`**
+- **Gemini delta 算法修复**（段落重置不再重复累加）
+- **网络重试**（指数退避 3 次，覆盖超时 / 429 / 5xx）
+- **turn ID 锚点 + 元数据注释**（`<!-- sw: turn="N" ... -->`）
+- **轮次分隔线**（Markdown `---`、HTML `<hr>`）
+- **快照尊重 user_input_mode**（`details` / `blockquote` 均正确）
+- **`detect_next_turn_id` 尾部 8 KB 快速扫描**
+- **上下文记忆文件**（`--context-file`，自动注入 system prompt + AI 自动更新标记）
+- **记录独立开关**（`--record / --no-record`，记录与上下文解耦）
 
-#### P1（建议下一步做）
+#### P1（下一步重点）
 
-- **自动分章节/标签写入（剧情/设定/灵感）**
-  - 必要性：中。不是 MVP 必需，但对长期写作管理很有价值。
-  - 对目标贴合度：提升“可维护性”，不影响核心“实时镜像”能力。
+- **上下文记忆文件（Context File）** — 见 §6
+  - 通过 `--context-file` 加载结构化项目上下文，自动注入 system prompt
+  - 解决长对话滑窗截断后丢失全局设定的问题
+- **上下文窗口管理**
+  - history 增长到阈值后自动截断 / 摘要，防止 token 溢出
+  - 与 Context File 联动：截断前将关键决策写入 context 文件
 
 #### P2（可选增强）
 
-- 自动滚动锚点、断点恢复、按日归档、会话导出索引。
+- 自动分章节 / 标签写入（剧情 / 设定 / 灵感）
+- 按日归档、会话导出索引
+- 断点恢复（CLI 重启后自动恢复对话上下文）
 
 ### 当前结论
 
-先走“方案 2”是正确路线。它已经具备跨模型能力（通过接口适配层），下一阶段优先补齐流式体验，再做结构化写作分区。
+先走"方案 2"是正确路线。CLI 已具备跨模型流式写作、断点续写（turn ID）、
+网络容错等核心能力。下一阶段重点是 **Context File** 解决长对话记忆问题，
+同步探索方案 3（Chrome 扩展）实现网页端实时穿透。
 
 ### 路线 3 设计沉淀
 
-- 详见：`ROUTE3_BASELINE.md`
-- 内容包括：目标、现状、可借鉴点、路线 3 的 M0/M1 实现建议、风险与优先级。
-
+- 详见：[ROUTE3_BASELINE.md](ROUTE3_BASELINE.md)
+- 架构方向：**Chrome 扩展（Manifest V3）+ 本地 Python HTTP 服务**
+  - 前端：Chrome 扩展，借鉴 Chat Memo 的 `BasePlatformAdapter` + `MutationObserver` + debounce 模式
+  - 后端：复用 `shadowwrite_cli.py` 的 writer 逻辑，提供 HTTP POST 接口接收增量内容
+  - 选择 Chrome 扩展而非油猴脚本：更稳定的生命周期、原生 `chrome.storage`、可发布到商店
+- Chat Memo 可借鉴模式：
+  - 多平台适配器架构（ChatGPT / DeepSeek / Gemini / Claude / Kimi）
+  - `MutationObserver` + 1 秒 debounce 增量抓取
+  - URL 变化监听（`popstate` / `pushState` 拦截）自动切换会话
+  - 锚点匹配算法处理懒加载 DOM 回收
 
 ## 5. CLI 多行输入（`/ml`）
 
@@ -176,3 +224,144 @@ AI> （模型开始正常回复，并流式写入 .md/.html）
 - 这不是本地假输入，`/end` 后会按正常流程调用 API。
 - 在 `details` 模式下，用户多行输入会以 `<br>` 保留换行写入 Markdown，兼容 Typora 的折叠限制。
 - 在 `blockquote` 模式下，会按 Markdown 引用块格式写入。
+
+## 6. 上下文记忆文件（Context File）
+
+### 问题
+
+LLM 对话的上下文窗口是有限的。无论是长篇小说协作、论文实验设计、还是项目开发，
+当会话积累到几万 token 后，早期的关键信息会被滑窗截断丢失：
+- 小说：角色表、世界观、剧情决策
+- 论文：motivation、story line、实验设计主线、已有结果
+- 项目：出发点、架构决策、已完成/未完成任务、关键变更日志
+
+这导致 AI “忘记”之前约定的内容，仅从近期对话中找信息会产生偏差。
+
+### 解决思路
+
+引入一个**人工可审阅、AI 可更新**的结构化文件（如 context.md），
+作为对话之外的“持久记忆层”——相当于一个实时、准确的项目说明文档：
+
+`
+project_root/
+├── novel_draft.md          ← 主输出文件
+├── novel_draft.chat.html   ← 聊天视图
+└── context.md              ← 上下文记忆文件
+`
+
+### 设计要点
+
+1. **自动注入**：CLI 启动时读取 context.md，将其内容作为 system prompt 的一部分发送给模型。
+   模型从第一轮就“知道”所有关键上下文。
+2. **AI 可更新**：system prompt 中附带指令，要求模型在出现重要变更时，
+   输出特殊标记（<!-- context-update: ... -->），CLI 解析后自动追加到 context.md。
+   用户只需偶尔自行确认或修改，类似 /trim 但更规范化。
+3. **用户可审阅**：context.md 是普通 Markdown 文件，随时可在 VS Code 中查看、编辑、
+   删减，保持上下文精简准确。也方便项目交接和进度同步。
+4. **与截断联动**（可选）：当 history 消息数超过阈值触发截断时，截断前自动要求模型
+   生成一段摘要写入 context.md，确保关键信息不丢失。
+
+> **关于文件结构**：context.md 的结构完全由用户自定义。AI 不会自动选择"小说模式"
+> 或"论文模式"——你创建什么结构，AI 就在那个结构上追加增量更新。
+> 下面的示例只是模板参考，实际内容会随项目发展变得更丰富。
+> 首次使用时也可以通过 `/context update` 让 AI 根据对话内容生成初始版本。
+
+### 记录与上下文的独立开关
+
+记录写入（`.md` / `.html`）和上下文记忆文件是**完全解耦**的两个功能：
+
+```bash
+# 小说协作：记录 + 上下文
+python shadowwrite_cli.py --context-file context.md
+
+# 项目开发：只要上下文，不需要记录每次对话
+python shadowwrite_cli.py --no-record --context-file context.md
+
+# 零散提问：只保存记录，不需要上下文
+python shadowwrite_cli.py
+
+# 纯聊天：什么都不保存
+python shadowwrite_cli.py --no-record
+```
+
+| 场景 | `--record` | `--context-file` | 说明 |
+|------|-----------|-----------------|------|
+| 小说 / 长文协作 | ✅ on | ✅ 指定 | 完整记录 + 持久上下文 |
+| 项目开发迭代 | ❌ off | ✅ 指定 | 只维护项目上下文，不记录零碎对话 |
+| 随手提问 / 学习 | ✅ on | ❌ 不指定 | 保留对话记录以备查阅 |
+| 一次性聊天 | ❌ off | ❌ 不指定 | 纯终端对话 |
+
+### 预期用法
+
+`bash
+# 指定 context 文件启动
+python shadowwrite_cli.py --context-file context.md
+
+# 交互中手动触发 context 更新
+You> /context           # 查看当前 context 文件内容
+You> /context update    # 要求 AI 生成上下文摘要并写入
+`
+
+### Context 文件示例结构
+
+根据不同场景，文件结构可以灵活调整：
+
+**小说协作**：
+`markdown
+# 项目上下文
+
+## 核心设定
+- 时代：近未来 2089 年
+- 地点：新东京地下城
+- 主题：记忆交易与身份认同
+
+## 角色表
+| 角色 | 特征 | 当前状态 |
+|------|------|---------|
+| 林夜 | 失忆侦探 | 正在调查“空白人”案件 |
+
+## 关键决策记录
+- [Turn 5] 决定采用第一人称叙事
+`
+
+**论文实验**：
+`markdown
+# 项目上下文
+
+## Motivation & Story
+- 核心问题：...的暴露偏差问题
+- 主线：通过...方法降低偏差同时保持性能
+
+## 实验设计
+| 实验 | 目的 | 状态 |
+|------|------|------|
+| Table 1 | 主实验对比 | ✅ 完成 |
+| Table 2 | Ablation | ⚠️ 进行中 |
+
+## 已有结果摘要
+- Baseline: 78.3%
+- Ours (v1): 82.1%
+`
+
+**项目开发**（如本项目）：
+`markdown
+# 项目上下文
+
+## 出发点
+- 实时、静默追加 AI 对话到本地 Markdown
+
+## 架构决策
+- 方案 2 (API + CLI) 为主，同步探索方案 3 (Chrome 扩展)
+- 纯 stdlib，无第三方依赖
+
+## 任务跟踪
+- [x] 流式输出 + 双文件写入
+- [x] Gemini delta 修复
+- [x] turn ID 锚点
+- [ ] Context File 实现
+- [ ] 上下文窗口管理
+
+## 变更日志
+- 2026-02-21: 完成 turn 分隔线、网络重试、尾部扫描优化
+`
+

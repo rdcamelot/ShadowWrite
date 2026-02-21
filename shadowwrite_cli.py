@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -46,6 +47,8 @@ class AppConfig:
     chat_html_path: Path
     show_timestamp: bool
     user_input_mode: str
+    context_file: Path | None
+    record: bool
 
 
 def parse_bool(value: str | None, default: bool) -> bool:
@@ -115,9 +118,22 @@ def parse_args() -> argparse.Namespace:
         help="Optional system prompt.",
     )
     parser.add_argument(
+        "--context-file",
+        default=os.getenv("SHADOWWRITE_CONTEXT_FILE", ""),
+        help="Path to a context memory file (Markdown). "
+             "Its content is injected into the system prompt.",
+    )
+    parser.add_argument(
         "--section",
         default=os.getenv("SHADOWWRITE_SECTION", ""),
         help="Manual section label used in Markdown headings.",
+    )
+    parser.add_argument(
+        "--record",
+        action=argparse.BooleanOptionalAction,
+        default=parse_bool(os.getenv("SHADOWWRITE_RECORD"), True),
+        help="Write conversation to .md/.html files (default: true). "
+             "Use --no-record to chat without saving transcripts.",
     )
     parser.add_argument(
         "--stream",
@@ -216,6 +232,9 @@ def resolve_config(args: argparse.Namespace) -> AppConfig:
             "Missing API key. Set SHADOWWRITE_API_KEY or provider-specific keys."
         )
 
+    ctx_raw = getattr(args, "context_file", "").strip()
+    context_file = Path(ctx_raw) if ctx_raw else None
+
     return AppConfig(
         provider=provider,
         model=model,
@@ -231,6 +250,8 @@ def resolve_config(args: argparse.Namespace) -> AppConfig:
         chat_html_path=resolve_chat_html_path(output_path, args.chat_html_output),
         show_timestamp=bool(args.show_time),
         user_input_mode=args.user_input_mode,
+        context_file=context_file,
+        record=bool(args.record),
     )
 
 
@@ -485,30 +506,77 @@ def iter_gemini_stream(config: AppConfig, messages: List[Message]) -> Iterator[s
             elif previous_full_text and current_full_text in previous_full_text:
                 delta = ""
             else:
+                # Gemini reset boundary: treat as new segment, don't concatenate.
                 delta = current_full_text
-                previous_full_text = previous_full_text + current_full_text
+                previous_full_text = current_full_text
 
             if delta:
                 yield delta
 
 
 def stream_model(config: AppConfig, messages: List[Message]) -> Iterator[str]:
+    """Stream model response with retry on transient network errors.
+
+    Retries up to 3 times with exponential backoff (2s, 4s, 8s) for network
+    errors.  On streaming failure it falls back to a non-stream request.
+    """
+    max_retries = 3
+
     if not config.stream:
-        full_text = call_model(config, messages)
-        if full_text:
-            yield full_text
+        for attempt in range(max_retries):
+            try:
+                full_text = call_model(config, messages)
+                if full_text:
+                    yield full_text
+                return
+            except RuntimeError as exc:
+                if attempt < max_retries - 1 and _is_retryable(exc):
+                    wait = 2 ** (attempt + 1)
+                    print(f"\n[Retry] Network error, retrying in {wait}s... ({exc})")
+                    time.sleep(wait)
+                else:
+                    raise
         return
 
-    try:
-        if config.provider == "gemini":
-            yield from iter_gemini_stream(config, messages)
-        else:
-            yield from iter_openai_stream(config, messages)
-    except Exception as exc:
-        print(f"\n[Warn] Streaming failed, fallback to non-stream: {exc}")
-        full_text = call_model(config, messages)
-        if full_text:
-            yield full_text
+    for attempt in range(max_retries):
+        try:
+            if config.provider == "gemini":
+                yield from iter_gemini_stream(config, messages)
+            else:
+                yield from iter_openai_stream(config, messages)
+            return  # success
+        except Exception as exc:
+            if attempt < max_retries - 1 and _is_retryable(exc):
+                wait = 2 ** (attempt + 1)
+                print(f"\n[Retry] Streaming error, retrying in {wait}s... ({exc})")
+                time.sleep(wait)
+                continue
+            # Last resort: try non-stream fallback once
+            print(f"\n[Warn] Streaming failed, fallback to non-stream: {exc}")
+            try:
+                full_text = call_model(config, messages)
+                if full_text:
+                    yield full_text
+            except Exception as fallback_exc:
+                raise RuntimeError(
+                    f"All retries exhausted. Last error: {fallback_exc}"
+                ) from fallback_exc
+            return
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Return True for transient network / server errors worth retrying."""
+    msg = str(exc).lower()
+    # Retry on connection errors, timeouts, and server-side 5xx errors
+    if "network error" in msg or "timeout" in msg or "timed out" in msg:
+        return True
+    if "urlopen error" in msg or "connection" in msg:
+        return True
+    # HTTP 5xx server errors
+    for code in ("http 500", "http 502", "http 503", "http 429"):
+        if code in msg:
+            return True
+    return False
 
 
 def ensure_output_file(path: Path, config: AppConfig) -> None:
@@ -563,11 +631,16 @@ def format_turn_link(
     stamp: str,
     section: str,
     show_timestamp: bool,
+    turn_id: int | None = None,
 ) -> str:
     label = format_turn_summary(role, stamp, section, show_timestamp)
     tooltip = format_turn_tooltip(role, stamp, section)
     safe_label = label.replace("[", r"\[").replace("]", r"\]")
-    return f'[{safe_label}](# "{tooltip}")'
+    if turn_id is not None:
+        anchor = f"#sw-turn-{turn_id}"
+    else:
+        anchor = "#"
+    return f'[{safe_label}]({anchor} "{tooltip}")'
 
 
 def format_details_body_text(text: str) -> str:
@@ -578,16 +651,30 @@ def format_details_body_text(text: str) -> str:
     return "<br>\n".join(html_escape(line) for line in lines)
 
 
-def detect_next_turn_id(path: Path) -> int:
-    if not path.exists():
-        return 1
-    text = path.read_text(encoding="utf-8", errors="ignore")
-    comment_hits = re.findall(r'<!--\s*sw:\s*turn="(\d+)"', text)
-    id_hits = re.findall(r'id="sw-turn-(\d+)"', text)
-    hits = [*comment_hits, *id_hits]
-    if not hits:
-        return 1
-    return max(int(x) for x in hits) + 1
+def detect_next_turn_id(*paths: Path) -> int:
+    """Scan one or more files for the highest sw-turn-N and return N+1.
+
+    Only reads the last portion of each file for performance on large files.
+    """
+    TAIL_BYTES = 8192  # 8 KB should cover the last several turns
+    max_id = 0
+    for path in paths:
+        if not path.exists():
+            continue
+        file_size = path.stat().st_size
+        if file_size <= TAIL_BYTES:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        else:
+            with path.open("rb") as fh:
+                fh.seek(-TAIL_BYTES, 2)  # seek from end
+                raw = fh.read()
+            text = raw.decode("utf-8", errors="ignore")
+        comment_hits = re.findall(r'<!--\s*sw:\s*turn="(\d+)"', text)
+        id_hits = re.findall(r'id="sw-turn-(\d+)"', text)
+        hits = [*comment_hits, *id_hits]
+        if hits:
+            max_id = max(max_id, max(int(x) for x in hits))
+    return max_id + 1 if max_id else 1
 
 
 def ensure_chat_html_file(path: Path, config: AppConfig) -> None:
@@ -1042,24 +1129,36 @@ def append_user_turn(
     section: str,
     show_timestamp: bool,
     mode: str,
+    turn_id: int | None = None,
 ) -> None:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     summary = format_turn_summary("User Input", stamp, section, show_timestamp)
-    summary_link = format_turn_link("User Input", stamp, section, show_timestamp)
+    summary_link = format_turn_link("User Input", stamp, section, show_timestamp, turn_id)
     tooltip = format_turn_tooltip("User Input", stamp, section)
+
+    # Metadata comment and anchor for turn tracking
+    meta = ""
+    if turn_id is not None:
+        meta = (
+            f'<!-- sw: turn="{turn_id}" role="user" ts="{stamp}" -->\n'
+            f'<a id="sw-turn-{turn_id}"></a>\n'
+        )
 
     if mode == "blockquote":
         block = (
-            "\n\n"
+            "\n\n---\n\n"
+            f"{meta}"
             f"{summary_link}\n\n"
             f"{quote_markdown(text)}\n"
         )
     else:
         details_body = format_details_body_text(text)
+        anchor_href = f"#sw-turn-{turn_id}" if turn_id is not None else "#"
         block = (
-            "\n\n"
+            "\n\n---\n\n"
+            f"{meta}"
             "<details class=\"sw-user-turn\"><summary>"
-            f"<strong><a href=\"#\" title=\"{html_escape(tooltip)}\">{html_escape(summary)}</a></strong>"
+            f"<strong><a href=\"{anchor_href}\" title=\"{html_escape(tooltip)}\">{html_escape(summary)}</a></strong>"
             f"</summary>{details_body}</details>\n"
         )
 
@@ -1090,12 +1189,22 @@ def open_assistant_block(
     path: Path,
     section: str,
     show_timestamp: bool,
+    turn_id: int | None = None,
 ) -> Iterator[TextIO]:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    summary_link = format_turn_link("Assistant", stamp, section, show_timestamp)
+    summary_link = format_turn_link("Assistant", stamp, section, show_timestamp, turn_id)
+
+    meta = ""
+    if turn_id is not None:
+        meta = (
+            f'<!-- sw: turn="{turn_id}" role="assistant" ts="{stamp}" -->\n'
+            f'<a id="sw-turn-{turn_id}"></a>\n'
+        )
+
     with path.open("a", encoding="utf-8") as fh:
         fh.write(
             "\n\n"
+            f"{meta}"
             f"{summary_link}\n\n"
         )
         yield fh
@@ -1125,7 +1234,7 @@ def append_chat_user_turn(path: Path, text: str, section: str, turn_id: int) -> 
     time_html = f'<span class="time"> - {html_escape(stamp)}</span>'
     body = html_escape(text)
     fragment = (
-        f'\n<details class="turn user" id="{html_escape(anchor_id)}">'
+        f'\n<hr>\n<details class="turn user" id="{html_escape(anchor_id)}">'
         f"<summary>{html_escape(summary)}{time_html}</summary>"
         f'<pre class="body">{body}</pre>'
         "</details>\n"
@@ -1140,6 +1249,7 @@ def write_snapshot(
     provider: str,
     model: str,
     target_path: str = "",
+    user_input_mode: str = "blockquote",
 ) -> Path:
     now = datetime.now()
     if target_path.strip():
@@ -1169,10 +1279,19 @@ def write_snapshot(
             lines.append("")
             continue
         if msg["role"] == "user":
-            lines.append("#### User Input")
-            lines.append("")
-            lines.append(quote_markdown(msg["content"]))
-            lines.append("")
+            if user_input_mode == "details":
+                details_body = format_details_body_text(msg["content"])
+                lines.append(
+                    '<details class="sw-user-turn"><summary>'
+                    "<strong>User Input</strong>"
+                    f"</summary>{details_body}</details>"
+                )
+                lines.append("")
+            else:
+                lines.append("#### User Input")
+                lines.append("")
+                lines.append(quote_markdown(msg["content"]))
+                lines.append("")
             continue
         lines.append("### Assistant")
         lines.append("")
@@ -1181,6 +1300,101 @@ def write_snapshot(
 
     snapshot_path.write_text("\n".join(lines), encoding="utf-8")
     return snapshot_path
+
+
+# ---------------------------------------------------------------------------
+# Context File helpers
+# ---------------------------------------------------------------------------
+
+_CONTEXT_UPDATE_RE = re.compile(
+    r"<!--\s*context-update:\s*(.*?)\s*-->", re.DOTALL
+)
+
+_CONTEXT_INJECTION_TEMPLATE = (
+    "=== PROJECT CONTEXT (from {path}) ===\n"
+    "{content}\n"
+    "=== END PROJECT CONTEXT ===\n\n"
+    "IMPORTANT: The above is the persistent project context.  "
+    "When a significant change occurs (new decision, completed task, "
+    "key result, plot development, character change, etc.), output a "
+    "context update marker in the following format INSIDE your reply:\n"
+    "<!-- context-update: <concise description of the change> -->\n"
+    "The CLI will automatically append it to the context file.  "
+    "Only emit this marker for genuinely important changes, not for "
+    "every minor detail."
+)
+
+
+def load_context_file(path: Path) -> str:
+    """Read and return the context file content, or empty string if missing."""
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        print(f"[Warn] Cannot read context file {path}: {exc}")
+        return ""
+
+
+def build_system_prompt(
+    user_prompt: str,
+    context_file: Path | None,
+) -> str:
+    """Combine user system prompt with context file content."""
+    parts: list[str] = []
+    if context_file:
+        ctx = load_context_file(context_file)
+        if ctx:
+            parts.append(
+                _CONTEXT_INJECTION_TEMPLATE.format(
+                    path=context_file.name, content=ctx
+                )
+            )
+    if user_prompt:
+        parts.append(user_prompt)
+    return "\n\n".join(parts)
+
+
+def extract_context_updates(text: str) -> list[str]:
+    """Find all <!-- context-update: ... --> markers in text."""
+    return _CONTEXT_UPDATE_RE.findall(text)
+
+
+def append_context_updates(
+    context_file: Path, updates: list[str], turn_id: int | None = None,
+) -> int:
+    """Append context update lines to the context file. Returns count."""
+    if not updates:
+        return 0
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines: list[str] = []
+    for upd in updates:
+        prefix = f"- [{ts}]"
+        if turn_id is not None:
+            prefix = f"- [{ts} Turn {turn_id}]"
+        lines.append(f"{prefix} {upd.strip()}")
+
+    with open(context_file, "a", encoding="utf-8") as fh:
+        fh.write("\n" + "\n".join(lines) + "\n")
+    return len(lines)
+
+
+def show_context(context_file: Path | None) -> None:
+    """Print current context file content."""
+    if not context_file:
+        print("[Info] No --context-file specified.")
+        return
+    if not context_file.exists():
+        print(f"[Info] Context file not found: {context_file}")
+        print("  It will be created when the first context update is written.")
+        return
+    content = load_context_file(context_file)
+    if not content:
+        print("[Info] Context file is empty.")
+        return
+    print(f"--- context: {context_file} ---")
+    print(content)
+    print(f"--- end context ({len(content)} chars) ---")
 
 
 def print_help(startup: bool = False) -> None:
@@ -1199,6 +1413,8 @@ def print_help(startup: bool = False) -> None:
     print("  /ml                Multi-line user input mode (end with /end)")
     print("  /note <markdown>   Append a manual note line to Markdown")
     print("  /snapshot [path]   Save current in-memory conversation snapshot")
+    print("  /context           Show current context file content")
+    print("  /context update    Ask AI to generate context summary & save")
     print("  /exit              Exit")
 
 
@@ -1232,27 +1448,40 @@ def apply_system_prompt(history: List[Message], prompt: str) -> None:
 
 
 def run_chat(config: AppConfig) -> int:
-    ensure_output_file(config.output_path, config)
-    if config.chat_html:
-        ensure_chat_html_file(config.chat_html_path, config)
-    next_turn_id = (
-        detect_next_turn_id(config.chat_html_path) if config.chat_html else 1
-    )
+    if config.record:
+        ensure_output_file(config.output_path, config)
+        if config.chat_html:
+            ensure_chat_html_file(config.chat_html_path, config)
+
+    # Detect next turn ID from all output files
+    scan_paths: list[Path] = []
+    if config.record:
+        scan_paths.append(config.output_path)
+        if config.chat_html:
+            scan_paths.append(config.chat_html_path)
+    next_turn_id = detect_next_turn_id(*scan_paths) if scan_paths else 1
 
     history: List[Message] = []
-    if config.system_prompt:
-        history.append({"role": "system", "content": config.system_prompt})
+    effective_prompt = build_system_prompt(config.system_prompt, config.context_file)
+    if effective_prompt:
+        history.append({"role": "system", "content": effective_prompt})
 
     print(f"Provider: {config.provider}")
     print(f"Model:    {config.model}")
-    print(f"Output:   {config.output_path}")
+    if config.record:
+        print(f"Output:   {config.output_path}")
+        if config.chat_html:
+            print(f"ChatView: {config.chat_html_path}")
+    else:
+        print("Record:   off (no file output)")
     print(f"Stream:   {config.stream}")
-    if config.chat_html:
-        print(f"ChatView: {config.chat_html_path}")
+    if config.context_file:
+        exists = config.context_file.exists()
+        print(f"Context:  {config.context_file} ({'loaded' if exists else 'will create'})")
     print_help(startup=True)
 
     current_section = config.default_section
-    if current_section:
+    if current_section and config.record:
         append_section_marker(config.output_path, current_section)
         if config.chat_html:
             append_chat_section_marker(config.chat_html_path, current_section)
@@ -1296,9 +1525,10 @@ def run_chat(config: AppConfig) -> int:
             new_section = user_text[len("/section") :].strip()
             current_section = new_section
             if new_section:
-                append_section_marker(config.output_path, new_section)
-                if config.chat_html:
-                    append_chat_section_marker(config.chat_html_path, new_section)
+                if config.record:
+                    append_section_marker(config.output_path, new_section)
+                    if config.chat_html:
+                        append_chat_section_marker(config.chat_html_path, new_section)
                 print(f"Section switched: {new_section}")
             else:
                 print("Section cleared.")
@@ -1308,10 +1538,13 @@ def run_chat(config: AppConfig) -> int:
             if not note:
                 print("Usage: /note <markdown>")
                 continue
-            append_note(config.output_path, note)
-            if config.chat_html:
-                append_chat_note(config.chat_html_path, note)
-            print("Note appended.")
+            if config.record:
+                append_note(config.output_path, note)
+                if config.chat_html:
+                    append_chat_note(config.chat_html_path, note)
+                print("Note appended.")
+            else:
+                print("[Info] Record is off. Note not written.")
             continue
         if user_text.startswith("/snapshot") and not multiline_mode:
             target = user_text[len("/snapshot") :].strip()
@@ -1321,58 +1554,117 @@ def run_chat(config: AppConfig) -> int:
                 provider=config.provider,
                 model=config.model,
                 target_path=target,
+                user_input_mode=config.user_input_mode,
             )
             print(f"Snapshot saved: {snapshot_path}")
             continue
+        if user_text.startswith("/context") and not multiline_mode:
+            sub = user_text[len("/context"):].strip()
+            if sub == "update":
+                # Ask AI to generate a context summary
+                if not config.context_file:
+                    print("[Info] No --context-file specified. Use --context-file <path> to enable.")
+                    continue
+                ctx_prompt = (
+                    "Please review our conversation so far and generate a concise "
+                    "context summary covering: key decisions, current status, "
+                    "important results, and any unresolved items. "
+                    "Output the summary as a single <!-- context-update: ... --> marker."
+                )
+                history.append({"role": "user", "content": ctx_prompt})
+                print("\nAI> ", end="", flush=True)
+                parts: List[str] = []
+                try:
+                    for chunk in stream_model(config, history):
+                        if not chunk:
+                            continue
+                        print(chunk, end="", flush=True)
+                        parts.append(chunk)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"\n[Error] {exc}")
+                    history.pop()  # remove the ctx_prompt
+                    continue
+                print("")
+                summary = "".join(parts).strip()
+                if summary:
+                    history.append({"role": "assistant", "content": summary})
+                    updates = extract_context_updates(summary)
+                    if updates:
+                        n = append_context_updates(config.context_file, updates)
+                        print(f"[Context] {n} update(s) written to {config.context_file}")
+                        # Refresh system prompt with updated context
+                        new_prompt = build_system_prompt(config.system_prompt, config.context_file)
+                        apply_system_prompt(history, new_prompt)
+                    else:
+                        print("[Warn] AI response did not contain context-update markers.")
+                        print("  You can manually edit the context file.")
+                else:
+                    print("[Warn] Empty response.")
+                    history.pop()
+                continue
+            else:
+                show_context(config.context_file)
+                continue
 
-        append_user_turn(
-            config.output_path,
-            user_text,
-            current_section,
-            config.show_timestamp,
-            config.user_input_mode,
-        )
-        if config.chat_html:
-            user_turn_id = next_turn_id
-            next_turn_id += 1
-            append_chat_user_turn(
-                config.chat_html_path,
+        # Allocate turn IDs for both .md and .html
+        user_turn_id = next_turn_id
+        next_turn_id += 1
+
+        if config.record:
+            append_user_turn(
+                config.output_path,
                 user_text,
                 current_section,
-                user_turn_id,
+                config.show_timestamp,
+                config.user_input_mode,
+                turn_id=user_turn_id,
             )
+            if config.chat_html:
+                append_chat_user_turn(
+                    config.chat_html_path,
+                    user_text,
+                    current_section,
+                    user_turn_id,
+                )
         history.append({"role": "user", "content": user_text})
 
         answer_parts: List[str] = []
         print("\nAI> ", end="", flush=True)
         try:
-            assistant_turn_id = None
-            if config.chat_html:
-                assistant_turn_id = next_turn_id
-                next_turn_id += 1
-            html_ctx = (
-                open_assistant_chat_block(
-                    config.chat_html_path,
-                    current_section,
-                    assistant_turn_id,
+            assistant_turn_id = next_turn_id
+            next_turn_id += 1
+            if config.record:
+                html_ctx = (
+                    open_assistant_chat_block(
+                        config.chat_html_path,
+                        current_section,
+                        assistant_turn_id,
+                    )
+                    if config.chat_html
+                    else nullcontext(None)
                 )
-                if config.chat_html
-                else nullcontext(None)
-            )
-            with open_assistant_block(
-                config.output_path,
-                current_section,
-                config.show_timestamp,
-            ) as writer, html_ctx as html_writer:
+                with open_assistant_block(
+                    config.output_path,
+                    current_section,
+                    config.show_timestamp,
+                    turn_id=assistant_turn_id,
+                ) as writer, html_ctx as html_writer:
+                    for chunk in stream_model(config, history):
+                        if not chunk:
+                            continue
+                        print(chunk, end="", flush=True)
+                        writer.write(chunk)
+                        writer.flush()
+                        if html_writer:
+                            html_writer.write(html_escape(chunk))
+                            html_writer.flush()
+                        answer_parts.append(chunk)
+            else:
+                # No record: just stream to terminal
                 for chunk in stream_model(config, history):
                     if not chunk:
                         continue
                     print(chunk, end="", flush=True)
-                    writer.write(chunk)
-                    writer.flush()
-                    if html_writer:
-                        html_writer.write(html_escape(chunk))
-                        html_writer.flush()
                     answer_parts.append(chunk)
         except Exception as exc:  # noqa: BLE001
             print(f"\n[Error] {exc}")
@@ -1384,6 +1676,18 @@ def run_chat(config: AppConfig) -> int:
             print("[Warn] Empty model response.")
             continue
         history.append({"role": "assistant", "content": answer})
+
+        # Check for context-update markers in AI output
+        if config.context_file:
+            ctx_updates = extract_context_updates(answer)
+            if ctx_updates:
+                n = append_context_updates(
+                    config.context_file, ctx_updates, turn_id=assistant_turn_id,
+                )
+                print(f"[Context] {n} update(s) auto-saved to {config.context_file}")
+                # Refresh system prompt so next turn uses updated context
+                new_sys = build_system_prompt(config.system_prompt, config.context_file)
+                apply_system_prompt(history, new_sys)
 
 
 def main() -> int:
