@@ -160,9 +160,6 @@ ShadowWrite 的核心理念是**将 AI 对话实时持久化到本地文件**。
 
 #### P1（下一步重点）
 
-- **上下文记忆文件（Context File）** — 见 §6
-  - 通过 `--context-file` 加载结构化项目上下文，自动注入 system prompt
-  - 解决长对话滑窗截断后丢失全局设定的问题
 - **上下文窗口管理**
   - history 增长到阈值后自动截断 / 摘要，防止 token 溢出
   - 与 Context File 联动：截断前将关键决策写入 context 文件
@@ -176,21 +173,66 @@ ShadowWrite 的核心理念是**将 AI 对话实时持久化到本地文件**。
 ### 当前结论
 
 先走"方案 2"是正确路线。CLI 已具备跨模型流式写作、断点续写（turn ID）、
-网络容错等核心能力。下一阶段重点是 **Context File** 解决长对话记忆问题，
-同步探索方案 3（Chrome 扩展）实现网页端实时穿透。
+网络容错等核心能力。Context File 已实现双标记格式（结构化块 + 行内日志），下一阶段重点是上下文窗口管理。
 
-### 路线 3 设计沉淀
+方案 3（Chrome 扩展 + 本地 HTTP 服务）M0 骨架已完成，见下方。
+
+### 路线 3 实现（M0 骨架）
 
 - 详见：[ROUTE3_BASELINE.md](ROUTE3_BASELINE.md)
 - 架构方向：**Chrome 扩展（Manifest V3）+ 本地 Python HTTP 服务**
-  - 前端：Chrome 扩展，借鉴 Chat Memo 的 `BasePlatformAdapter` + `MutationObserver` + debounce 模式
-  - 后端：复用 `shadowwrite_cli.py` 的 writer 逻辑，提供 HTTP POST 接口接收增量内容
-  - 选择 Chrome 扩展而非油猴脚本：更稳定的生命周期、原生 `chrome.storage`、可发布到商店
-- Chat Memo 可借鉴模式：
-  - 多平台适配器架构（ChatGPT / DeepSeek / Gemini / Claude / Kimi）
-  - `MutationObserver` + 1 秒 debounce 增量抓取
-  - URL 变化监听（`popstate` / `pushState` 拦截）自动切换会话
-  - 锚点匹配算法处理懒加载 DOM 回收
+
+#### 已实现（M0）
+
+**Chrome 扩展**（`extension/` 目录）：
+- `manifest.json` — MV3 配置，7 平台 content_scripts，`chrome.storage` + `tabs` 权限
+- `content/base-adapter.js` — `BaseShadowWriteAdapter` 基类
+  - 4 个抽象方法：`isValidConversationUrl`、`extractConversationInfo`、`extractMessages`、`isMessageElement`
+  - `MutationObserver`（childList + subtree + characterData）+ 1 秒 debounce
+  - JSON 快照差异比较，仅发送增量消息
+  - URL 轮询（1 秒）自动切换会话
+  - `fetch(POST)` 直接发送到本地 HTTP 服务
+- `content/content-common.js` — 状态指示器小圆点（idle/saving/ok/error）
+- `content/adapters/` — 7 个平台适配器：
+  - `chatgpt.js` — ChatGPT/OpenAI
+  - `deepseek.js` — DeepSeek（含 thinking 提取）
+  - `gemini.js` — Google Gemini
+  - `claude.js` — Anthropic Claude（含 thinking 过滤）
+  - `kimi.js` — Kimi/Moonshot
+  - `doubao.js` — 豆包（含 thinking 提取）
+  - `yuanbao.js` — 腾讯元宝
+- `background/service-worker.js` — 设置管理、badge 更新、设置变更广播
+- `popup/popup.html` + `popup.js` — 配置 UI（host/port/开关/连接测试）
+- `css/content.css` — 状态指示器样式
+
+**本地 HTTP 服务**（`shadowwrite_server.py`）：
+- 纯 stdlib，无第三方依赖
+- `POST /api/messages` — 接收扩展发送的增量消息，写入 `.md` + `.chat.html`
+- `GET /api/health` — 连接测试
+- `GET /api/conversations` — 查看当前活跃会话
+- 线程安全的会话状态管理（`ConversationState`）
+- `messageId` 幂等去重
+- CORS 支持
+- 默认端口 `24601`，输出到 `./outputs/`
+
+#### 用法
+
+```bash
+# 1. 启动本地 HTTP 服务
+python shadowwrite_server.py
+
+# 2. 在 Chrome 中加载扩展
+#    chrome://extensions → 开发者模式 → 加载已解压的扩展程序 → 选择 extension/ 目录
+
+# 3. 打开任意支持的 AI 平台对话，扩展自动捕获并发送到本地服务
+```
+
+#### M1（下一步）
+
+- 多轮去重优化（基于内容 hash 而非仅 position）
+- 扩展 popup 显示当前会话列表
+- 消息格式与 CLI 对齐（统一 turn 元数据格式）
+- CSS 选择器热更新机制（应对平台前端变更）
 
 ## 5. CLI 多行输入（`/ml`）
 
@@ -251,15 +293,25 @@ project_root/
 
 ### 设计要点
 
-1. **自动注入**：CLI 启动时读取 context.md，将其内容作为 system prompt 的一部分发送给模型。
-   模型从第一轮就“知道”所有关键上下文。
-2. **AI 可更新**：system prompt 中附带指令，要求模型在出现重要变更时，
-   输出特殊标记（<!-- context-update: ... -->），CLI 解析后自动追加到 context.md。
-   用户只需偶尔自行确认或修改，类似 /trim 但更规范化。
-3. **用户可审阅**：context.md 是普通 Markdown 文件，随时可在 VS Code 中查看、编辑、
+1. **自动注入**：CLI 启动时读取 context 文件，将其内容作为 system prompt 的一部分发送给模型。
+   模型从第一轮就"知道"所有关键上下文。
+2. **AI 可更新（双标记格式）**：system prompt 中附带指令，AI 可在回复中使用两种标记：
+   - **结构化块标记**（推荐，用于输出完整的设定、角色表、决策细节等）：
+     ```
+     <!-- context-update-start -->
+     ## 角色设定
+     - 陆明：25岁记者，好奇心旺盛，战斗力弱
+     - 从者：职阶待定，真名保密，初始态度冷静审视
+     <!-- context-update-end -->
+     ```
+     CLI 解析后将块内容**原样追加**到 context 文件，保留 Markdown 结构。
+   - **行内标记**（用于简短的状态记录）：
+     `<!-- context-update: 第一幕完成，主角进入地下排水系统 -->`
+     CLI 解析后追加为带时间戳的日志行。
+3. **用户可审阅**：context 文件是普通 Markdown 文件，随时可在 VS Code 中查看、编辑、
    删减，保持上下文精简准确。也方便项目交接和进度同步。
 4. **与截断联动**（可选）：当 history 消息数超过阈值触发截断时，截断前自动要求模型
-   生成一段摘要写入 context.md，确保关键信息不丢失。
+   生成一段摘要写入 context 文件，确保关键信息不丢失。
 
 > **关于文件结构**：context.md 的结构完全由用户自定义。AI 不会自动选择"小说模式"
 > 或"论文模式"——你创建什么结构，AI 就在那个结构上追加增量更新。
@@ -271,13 +323,13 @@ project_root/
 记录写入（`.md` / `.html`）和上下文记忆文件是**完全解耦**的两个功能：
 
 ```bash
-# 小说协作：记录 + 上下文
-python shadowwrite_cli.py --context-file context.md
+# 小说协作：记录 + 上下文（auto 按输出文件名自动生成）
+python shadowwrite_cli.py --context-file auto
 
 # 项目开发：只要上下文，不需要记录每次对话
-python shadowwrite_cli.py --no-record --context-file context.md
+python shadowwrite_cli.py --no-record --context-file auto
 
-# 零散提问：只保存记录，不需要上下文
+# 零散提问：只保存记录，不需要上下文（默认行为）
 python shadowwrite_cli.py
 
 # 纯聊天：什么都不保存
@@ -294,8 +346,13 @@ python shadowwrite_cli.py --no-record
 ### 预期用法
 
 `bash
-# 指定 context 文件启动
-python shadowwrite_cli.py --context-file context.md
+# 自动生成 context 文件（按输出文件名派生，如 test_03_context.md）
+python shadowwrite_cli.py --context-file auto
+
+# 指定 context 文件名
+python shadowwrite_cli.py --context-file my_context.md
+
+# 也可在 .env 中设置：SHADOWWRITE_CONTEXT_FILE=auto
 
 # 交互中手动触发 context 更新
 You> /context           # 查看当前 context 文件内容

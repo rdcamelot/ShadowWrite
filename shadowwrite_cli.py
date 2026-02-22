@@ -120,8 +120,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--context-file",
         default=os.getenv("SHADOWWRITE_CONTEXT_FILE", ""),
-        help="Path to a context memory file (Markdown). "
-             "Its content is injected into the system prompt.",
+        help="Context memory file. "
+             "'auto' = derive from output path (e.g. test_03_context.md); "
+             "a path = use that file; empty = disabled.",
     )
     parser.add_argument(
         "--section",
@@ -233,7 +234,17 @@ def resolve_config(args: argparse.Namespace) -> AppConfig:
         )
 
     ctx_raw = getattr(args, "context_file", "").strip()
-    context_file = Path(ctx_raw) if ctx_raw else None
+    if ctx_raw.lower() == "auto":
+        # Auto-derive from output path: test_03.md → test_03_context.md
+        context_file = output_path.parent / (output_path.stem + "_context.md")
+    elif ctx_raw:
+        ctx_path = Path(ctx_raw)
+        # Resolve relative context file path against the output file's directory
+        if not ctx_path.is_absolute():
+            ctx_path = output_path.parent / ctx_path
+        context_file = ctx_path
+    else:
+        context_file = None
 
     return AppConfig(
         provider=provider,
@@ -1310,18 +1321,40 @@ _CONTEXT_UPDATE_RE = re.compile(
     r"<!--\s*context-update:\s*(.*?)\s*-->", re.DOTALL
 )
 
-_CONTEXT_INJECTION_TEMPLATE = (
+_CONTEXT_BLOCK_RE = re.compile(
+    r"<!--\s*context-update-start\s*-->\s*?\n(.*?)\n\s*?<!--\s*context-update-end\s*-->",
+    re.DOTALL,
+)
+
+_CONTEXT_CONTENT_TEMPLATE = (
     "=== PROJECT CONTEXT (from {path}) ===\n"
     "{content}\n"
-    "=== END PROJECT CONTEXT ===\n\n"
-    "IMPORTANT: The above is the persistent project context.  "
-    "When a significant change occurs (new decision, completed task, "
-    "key result, plot development, character change, etc.), output a "
-    "context update marker in the following format INSIDE your reply:\n"
-    "<!-- context-update: <concise description of the change> -->\n"
-    "The CLI will automatically append it to the context file.  "
-    "Only emit this marker for genuinely important changes, not for "
-    "every minor detail."
+    "=== END PROJECT CONTEXT ==="
+)
+
+_CONTEXT_INSTRUCTION = (
+    "IMPORTANT: A persistent context file ({path}) is attached to this session.\n"
+    "This file is the LONG-TERM MEMORY that survives context window truncation.\n"
+    "When the conversation grows long (thousands of tokens), early messages will be\n"
+    "lost, but this file's content will always be re-injected into the system prompt.\n"
+    "Therefore, record SPECIFIC DETAILS — not just summaries.\n\n"
+    "Two marker formats are available:\n\n"
+    "1) STRUCTURED BLOCK (preferred for rich content):\n"
+    "<!-- context-update-start -->\n"
+    "## Section Heading\n"
+    "- Specific detail 1\n"
+    "- Specific detail 2\n"
+    "<!-- context-update-end -->\n\n"
+    "2) INLINE note (for simple one-line records):\n"
+    "<!-- context-update: concise description -->\n\n"
+    "Guidelines:\n"
+    "- Use BLOCK format for settings, character profiles, world rules, architecture\n"
+    "  decisions, experiment parameters, etc. Include actual values and details.\n"
+    "- Use INLINE format only for brief status notes (e.g. 'task X completed').\n"
+    "- Structure blocks with Markdown headings (##/###), tables, and lists.\n"
+    "- Only emit markers for genuinely important information.\n"
+    "- BAD:  <!-- context-update: character confirmed -->\n"
+    "  GOOD: a block with the full character profile, traits, and current status."
 )
 
 
@@ -1346,37 +1379,64 @@ def build_system_prompt(
         ctx = load_context_file(context_file)
         if ctx:
             parts.append(
-                _CONTEXT_INJECTION_TEMPLATE.format(
+                _CONTEXT_CONTENT_TEMPLATE.format(
                     path=context_file.name, content=ctx
                 )
             )
+        # Always inject the instruction so the AI knows to emit markers,
+        # even when the context file is empty or does not exist yet.
+        parts.append(
+            _CONTEXT_INSTRUCTION.format(path=context_file.name)
+        )
     if user_prompt:
         parts.append(user_prompt)
     return "\n\n".join(parts)
 
 
-def extract_context_updates(text: str) -> list[str]:
-    """Find all <!-- context-update: ... --> markers in text."""
-    return _CONTEXT_UPDATE_RE.findall(text)
+def extract_context_updates(text: str) -> tuple[list[str], list[str]]:
+    """Extract context updates from AI output.
+
+    Returns (blocks, inlines):
+      blocks  — list of structured Markdown content from block markers
+      inlines — list of one-liner descriptions from inline markers
+    Block markers are removed from text before scanning for inline markers
+    to avoid double-counting.
+    """
+    blocks = _CONTEXT_BLOCK_RE.findall(text)
+    text_without_blocks = _CONTEXT_BLOCK_RE.sub("", text)
+    inlines = _CONTEXT_UPDATE_RE.findall(text_without_blocks)
+    return blocks, inlines
 
 
 def append_context_updates(
-    context_file: Path, updates: list[str], turn_id: int | None = None,
+    context_file: Path,
+    blocks: list[str] | None = None,
+    inlines: list[str] | None = None,
+    turn_id: int | None = None,
 ) -> int:
-    """Append context update lines to the context file. Returns count."""
-    if not updates:
+    """Append context updates to the context file. Returns count written."""
+    blocks = blocks or []
+    inlines = inlines or []
+    if not blocks and not inlines:
         return 0
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    lines: list[str] = []
-    for upd in updates:
+    parts: list[str] = []
+
+    # Block updates: append structured content as-is
+    for blk in blocks:
+        parts.append(blk.strip())
+        parts.append("")  # blank line separator
+
+    # Inline updates: append as timestamped log lines
+    for upd in inlines:
         prefix = f"- [{ts}]"
         if turn_id is not None:
             prefix = f"- [{ts} Turn {turn_id}]"
-        lines.append(f"{prefix} {upd.strip()}")
+        parts.append(f"{prefix} {upd.strip()}")
 
     with open(context_file, "a", encoding="utf-8") as fh:
-        fh.write("\n" + "\n".join(lines) + "\n")
-    return len(lines)
+        fh.write("\n" + "\n".join(parts) + "\n")
+    return len(blocks) + len(inlines)
 
 
 def show_context(context_file: Path | None) -> None:
@@ -1566,10 +1626,15 @@ def run_chat(config: AppConfig) -> int:
                     print("[Info] No --context-file specified. Use --context-file <path> to enable.")
                     continue
                 ctx_prompt = (
-                    "Please review our conversation so far and generate a concise "
-                    "context summary covering: key decisions, current status, "
-                    "important results, and any unresolved items. "
-                    "Output the summary as a single <!-- context-update: ... --> marker."
+                    "Please review our conversation so far and generate a comprehensive "
+                    "context summary. Use structured block format:\n"
+                    "<!-- context-update-start -->\n"
+                    "## Section Heading\n"
+                    "- details...\n"
+                    "<!-- context-update-end -->\n\n"
+                    "Include ALL important details: settings, character profiles, "
+                    "key decisions, current status, and unresolved items. "
+                    "Organize with headings, tables, and lists."
                 )
                 history.append({"role": "user", "content": ctx_prompt})
                 print("\nAI> ", end="", flush=True)
@@ -1588,9 +1653,12 @@ def run_chat(config: AppConfig) -> int:
                 summary = "".join(parts).strip()
                 if summary:
                     history.append({"role": "assistant", "content": summary})
-                    updates = extract_context_updates(summary)
-                    if updates:
-                        n = append_context_updates(config.context_file, updates)
+                    blocks, inlines = extract_context_updates(summary)
+                    if blocks or inlines:
+                        n = append_context_updates(
+                            config.context_file, blocks=blocks,
+                            inlines=inlines,
+                        )
                         print(f"[Context] {n} update(s) written to {config.context_file}")
                         # Refresh system prompt with updated context
                         new_prompt = build_system_prompt(config.system_prompt, config.context_file)
@@ -1679,10 +1747,11 @@ def run_chat(config: AppConfig) -> int:
 
         # Check for context-update markers in AI output
         if config.context_file:
-            ctx_updates = extract_context_updates(answer)
-            if ctx_updates:
+            ctx_blocks, ctx_inlines = extract_context_updates(answer)
+            if ctx_blocks or ctx_inlines:
                 n = append_context_updates(
-                    config.context_file, ctx_updates, turn_id=assistant_turn_id,
+                    config.context_file, blocks=ctx_blocks,
+                    inlines=ctx_inlines, turn_id=assistant_turn_id,
                 )
                 print(f"[Context] {n} update(s) auto-saved to {config.context_file}")
                 # Refresh system prompt so next turn uses updated context

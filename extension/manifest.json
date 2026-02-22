@@ -1,0 +1,101 @@
+{
+  "manifest_version": 3,
+  "name": "ShadowWrite",
+  "version": "0.1.0",
+  "description": "Real-time AI chat → local Markdown persistence via local HTTP service.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:*/*",
+    "http://localhost:*/*"
+  ],
+  "background": {
+    "service_worker": "background/service-worker.js"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+      "js": [
+        "content/base-adapter.js",
+        "content/content-common.js",
+        "content/adapters/chatgpt.js"
+      ],
+      "css": ["css/content.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://chat.deepseek.com/*"],
+      "js": [
+        "content/base-adapter.js",
+        "content/content-common.js",
+        "content/adapters/deepseek.js"
+      ],
+      "css": ["css/content.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://gemini.google.com/*"],
+      "js": [
+        "content/base-adapter.js",
+        "content/content-common.js",
+        "content/adapters/gemini.js"
+      ],
+      "css": ["css/content.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://claude.ai/*"],
+      "js": [
+        "content/base-adapter.js",
+        "content/content-common.js",
+        "content/adapters/claude.js"
+      ],
+      "css": ["css/content.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://kimi.moonshot.cn/*", "https://*.kimi.com/*"],
+      "js": [
+        "content/base-adapter.js",
+        "content/content-common.js",
+        "content/adapters/kimi.js"
+      ],
+      "css": ["css/content.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.doubao.com/*"],
+      "js": [
+        "content/base-adapter.js",
+        "content/content-common.js",
+        "content/adapters/doubao.js"
+      ],
+      "css": ["css/content.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://yuanbao.tencent.com/*"],
+      "js": [
+        "content/base-adapter.js",
+        "content/content-common.js",
+        "content/adapters/yuanbao.js"
+      ],
+      "css": ["css/content.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
