@@ -36,64 +36,52 @@
       const messages = [];
       let position = 0;
 
-      // User messages (obfuscated class)
-      const userEls = document.querySelectorAll("._9663006");
-      userEls.forEach((el) => {
-        const textEl = el.querySelector(".fbb737a4");
-        if (textEl) {
-          messages.push({
-            messageId: this.generateMessageId("user", position),
-            sender: "user",
-            content: this.extractFormattedContent(textEl),
-            thinking: "",
-            position: position++,
-          });
-        }
-      });
+      // querySelectorAll returns in DOM order — correctly interleaves
+      const allEls = document.querySelectorAll("._9663006, ._4f9bf79._43c05b5");
 
-      // AI messages (obfuscated class)
-      const aiEls = document.querySelectorAll("._4f9bf79._43c05b5");
-      aiEls.forEach((el) => {
-        // Thinking content
-        let thinking = "";
-        const thinkEl =
-          el.querySelector(".ds-think-content") ||
-          el.querySelector(".e1675d8b .ds-markdown");
-        if (thinkEl) {
-          thinking = this.extractFormattedContent(thinkEl);
-        }
+      allEls.forEach((el) => {
+        if (el.matches("._9663006")) {
+          // User message
+          const textEl = el.querySelector(".fbb737a4");
+          if (textEl) {
+            messages.push({
+              messageId: this.generateMessageId("user", position),
+              sender: "user",
+              content: this.extractFormattedContent(textEl),
+              thinking: "",
+              position: position++,
+            });
+          }
+        } else {
+          // AI message
+          let thinking = "";
+          const thinkEl =
+            el.querySelector(".ds-think-content") ||
+            el.querySelector(".e1675d8b .ds-markdown");
+          if (thinkEl) {
+            thinking = this.extractFormattedContent(thinkEl);
+          }
 
-        // Main content — direct child .ds-markdown (not inside think block)
-        const mdEls = el.querySelectorAll(":scope > .ds-markdown, .ds-message > .ds-markdown");
-        let content = "";
-        for (const md of mdEls) {
-          if (!md.closest(".ds-think-content") && !md.closest(".e1675d8b")) {
-            content = this.extractFormattedContent(md);
-            break;
+          // Main content — .ds-markdown not inside think block
+          const mdEls = el.querySelectorAll(":scope > .ds-markdown, .ds-message > .ds-markdown");
+          let content = "";
+          for (const md of mdEls) {
+            if (!md.closest(".ds-think-content") && !md.closest(".e1675d8b")) {
+              content = this.extractFormattedContent(md);
+              break;
+            }
+          }
+
+          if (content) {
+            messages.push({
+              messageId: this.generateMessageId("AI", position),
+              sender: "AI",
+              content,
+              thinking,
+              position: position++,
+            });
           }
         }
-
-        if (content) {
-          messages.push({
-            messageId: this.generateMessageId("AI", position),
-            sender: "AI",
-            content,
-            thinking,
-            position: position++,
-          });
-        }
-      });
-
-      // Sort by DOM position
-      messages.sort((a, b) => {
-        const aEl = document.querySelectorAll("._9663006, ._4f9bf79._43c05b5")[a.position];
-        const bEl = document.querySelectorAll("._9663006, ._4f9bf79._43c05b5")[b.position];
-        if (aEl && bEl) {
-          const cmp = aEl.compareDocumentPosition(bEl);
-          if (cmp & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
-          if (cmp & Node.DOCUMENT_POSITION_PRECEDING) return 1;
-        }
-        return a.position - b.position;
       });
 
       return messages;

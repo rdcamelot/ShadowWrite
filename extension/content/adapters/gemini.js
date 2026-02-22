@@ -31,39 +31,83 @@
       };
     }
 
+    /**
+     * Extract meaningful conversation title (not generic "Google Gemini").
+     */
+    extractTitle() {
+      const title = document.title?.trim();
+      // Use page title only if it's actually a conversation-specific title
+      if (title && title !== "Gemini" && !title.startsWith("Google") && title.length > 2) {
+        return title.length > 80 ? title.substring(0, 80) + "…" : title;
+      }
+      // Fall back to first user message text
+      const firstUser = document.querySelector("user-query .query-text");
+      if (firstUser) {
+        const text = (firstUser.innerText || "").trim();
+        if (text) {
+          return text.length > 80 ? text.substring(0, 80) + "…" : text;
+        }
+      }
+      return null;
+    }
+
     extractMessages() {
       if (this.isInEditMode(document.body)) return [];
 
       const messages = [];
-      let position = 0;
 
-      // User queries
-      const userEls = document.querySelectorAll("user-query .query-text");
-      userEls.forEach((el) => {
-        messages.push({
-          messageId: this.generateMessageId("user", position),
-          sender: "user",
-          content: this.extractFormattedContent(el),
-          thinking: "",
-          position: position++,
-        });
-      });
+      // Gemini DOM: #chat-history > .conversation-container[]
+      // Each container has one user-query + one model-response.
+      const chatHistory = document.querySelector("#chat-history");
+      if (!chatHistory) {
+        console.log("[ShadowWrite] Gemini: #chat-history not found yet.");
+        return messages;
+      }
 
-      // Model responses
-      const aiEls = document.querySelectorAll("model-response .model-response-text");
-      aiEls.forEach((el) => {
-        const content = this.extractFormattedContent(el);
-        if (content) {
-          messages.push({
-            messageId: this.generateMessageId("AI", position),
-            sender: "AI",
-            content,
-            thinking: "",
-            position: position++,
-          });
+      const blocks = chatHistory.querySelectorAll(".conversation-container");
+      if (blocks.length === 0) {
+        console.log("[ShadowWrite] Gemini: no .conversation-container found.");
+        return messages;
+      }
+
+      blocks.forEach((block, blockIndex) => {
+        // Skip if user is editing in this block
+        if (this.isInEditMode(block)) return;
+
+        // User message (even position)
+        const userEl = block.querySelector("user-query .query-text");
+        if (userEl) {
+          const content = this.extractFormattedContent(userEl);
+          if (content) {
+            const pos = blockIndex * 2;
+            messages.push({
+              messageId: this.generateMessageId("user", pos),
+              sender: "user",
+              content,
+              thinking: "",
+              position: pos,
+            });
+          }
+        }
+
+        // AI response (odd position)
+        const aiEl = block.querySelector("model-response .model-response-text");
+        if (aiEl) {
+          const content = this.extractFormattedContent(aiEl);
+          if (content) {
+            const pos = blockIndex * 2 + 1;
+            messages.push({
+              messageId: this.generateMessageId("AI", pos),
+              sender: "AI",
+              content,
+              thinking: "",
+              position: pos,
+            });
+          }
         }
       });
 
+      console.log(`[ShadowWrite] Gemini: extracted ${messages.length} messages from ${blocks.length} blocks.`);
       return messages;
     }
 

@@ -36,32 +36,32 @@
       const messages = [];
       let position = 0;
 
-      // User messages
-      const userEls = document.querySelectorAll('[data-testid="user-message"]');
-      userEls.forEach((el) => {
-        messages.push({
-          messageId: this.generateMessageId("user", position),
-          sender: "user",
-          content: this.extractFormattedContent(el),
-          thinking: "",
-          position: position++,
-        });
-      });
+      // querySelectorAll returns elements in DOM order — this correctly
+      // interleaves user and AI messages.
+      const allEls = document.querySelectorAll(
+        '[data-testid="user-message"], .font-claude-response'
+      );
 
-      // AI messages — the formal response, excluding thinking blocks
-      const aiEls = document.querySelectorAll(".font-claude-response");
-      aiEls.forEach((el) => {
-        // Filter out thinking blocks (identified by transition-all + rounded-lg
-        // + collapsible button pattern)
-        const content = this._extractFormalResponse(el);
-        if (content) {
+      allEls.forEach((el) => {
+        if (el.matches('[data-testid="user-message"]')) {
           messages.push({
-            messageId: this.generateMessageId("AI", position),
-            sender: "AI",
-            content,
+            messageId: this.generateMessageId("user", position),
+            sender: "user",
+            content: this.extractFormattedContent(el),
             thinking: "",
             position: position++,
           });
+        } else {
+          const content = this._extractFormalResponse(el);
+          if (content) {
+            messages.push({
+              messageId: this.generateMessageId("AI", position),
+              sender: "AI",
+              content,
+              thinking: "",
+              position: position++,
+            });
+          }
         }
       });
 

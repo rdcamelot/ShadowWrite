@@ -22,9 +22,8 @@
 
   const DEBOUNCE_DELAY = 1000;            // ms after last DOM change
   const URL_POLL_INTERVAL = 1000;         // ms between URL polls
-  const DEFAULT_HOST = "http://127.0.0.1";
+  const DEFAULT_HOST = "127.0.0.1";
   const DEFAULT_PORT = 24601;
-  const API_PATH = "/api/messages";
 
   /* ------------------------------------------------------------------ */
   /*  BaseShadowWriteAdapter                                             */
@@ -42,6 +41,7 @@
       this.currentConversationId = null;
       this.lastMessagesJson = "";          // serialised snapshot for diff
       this.lastKnownUrl = location.href.split("?")[0];
+      this.isTracking = false;             // per-conversation tracking toggle
 
       // Observers / timers
       this.contentObserver = null;
@@ -139,19 +139,18 @@
       const url = location.href;
       if (!this.isValidConversationUrl(url)) {
         console.log("[ShadowWrite] Not a valid conversation page, waiting…");
+        // Notify UI — no active conversation
+        window.dispatchEvent(new CustomEvent("shadowwrite-tracking-state", {
+          detail: { tracking: false, hasConversation: false },
+        }));
         return;
       }
       const info = this.extractConversationInfo(url);
       this.currentConversationId = info.conversationId;
       this.pageUrl = url;
 
-      // Initial capture
-      if (this.settings.autoCapture) {
-        this._captureAndSend();
-      }
-
-      // Start observing DOM
-      this._setupMutationObserver();
+      // Check if this conversation is tracked (persisted per-conversation state)
+      this._loadTrackingState();
     }
 
     /* -------------------------------------------------------------- */
@@ -173,6 +172,92 @@
     }
 
     /* -------------------------------------------------------------- */
+    /*  Per-conversation Tracking                                      */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Load tracking state for current conversation from chrome.storage.local.
+     */
+    async _loadTrackingState() {
+      try {
+        const data = await chrome.storage.local.get({ trackedConversations: {} });
+        this.isTracking = !!data.trackedConversations[this.currentConversationId];
+      } catch {
+        this.isTracking = false;
+      }
+
+      // Notify UI
+      window.dispatchEvent(new CustomEvent("shadowwrite-tracking-state", {
+        detail: {
+          tracking: this.isTracking,
+          hasConversation: true,
+          conversationId: this.currentConversationId,
+        },
+      }));
+
+      if (this.isTracking) {
+        console.log(`[ShadowWrite] Tracking ON for ${this.currentConversationId}`);
+        this._captureAndSend();
+        this._setupMutationObserver();
+      } else {
+        console.log(`[ShadowWrite] Tracking OFF for ${this.currentConversationId} — click dot to enable`);
+      }
+    }
+
+    /**
+     * Enable tracking for the current conversation.
+     */
+    async enableTracking() {
+      if (!this.currentConversationId) return;
+      try {
+        const data = await chrome.storage.local.get({ trackedConversations: {} });
+        data.trackedConversations[this.currentConversationId] = {
+          title: this.extractTitle(),
+          platform: this.platform,
+          url: this.pageUrl,
+          enabledAt: new Date().toISOString(),
+        };
+        await chrome.storage.local.set(data);
+      } catch (err) {
+        console.warn("[ShadowWrite] Failed to save tracking state:", err);
+      }
+
+      this.isTracking = true;
+      window.dispatchEvent(new CustomEvent("shadowwrite-tracking-state", {
+        detail: { tracking: true, hasConversation: true, conversationId: this.currentConversationId },
+      }));
+
+      // Start capturing
+      this._captureAndSend();
+      this._setupMutationObserver();
+    }
+
+    /**
+     * Disable tracking for the current conversation.
+     */
+    async disableTracking() {
+      if (!this.currentConversationId) return;
+      try {
+        const data = await chrome.storage.local.get({ trackedConversations: {} });
+        delete data.trackedConversations[this.currentConversationId];
+        await chrome.storage.local.set(data);
+      } catch (err) {
+        console.warn("[ShadowWrite] Failed to save tracking state:", err);
+      }
+
+      this.isTracking = false;
+      window.dispatchEvent(new CustomEvent("shadowwrite-tracking-state", {
+        detail: { tracking: false, hasConversation: true, conversationId: this.currentConversationId },
+      }));
+
+      // Stop observer
+      if (this.contentObserver) {
+        this.contentObserver.disconnect();
+        this.contentObserver = null;
+      }
+    }
+
+    /* -------------------------------------------------------------- */
     /*  MutationObserver                                                */
     /* -------------------------------------------------------------- */
 
@@ -182,7 +267,7 @@
       }
 
       this.contentObserver = new MutationObserver((mutations) => {
-        if (!this.settings.autoCapture) return;
+        if (!this.settings.autoCapture || !this.isTracking) return;
 
         let hasRelevant = false;
         for (const mutation of mutations) {
@@ -236,6 +321,8 @@
       if (document.querySelector("textarea:focus")) return;
 
       const messages = this.extractMessages();
+      if (messages.length === 0) return; // nothing to send
+
       const json = JSON.stringify(messages);
 
       if (json !== this.lastMessagesJson) {
@@ -246,10 +333,22 @@
 
     /**
      * Capture current messages and send without diff check (initial load).
+     * Retries up to 3 times if DOM is not ready yet.
      */
-    _captureAndSend() {
+    _captureAndSend(retries = 0) {
       const messages = this.extractMessages();
-      if (messages.length === 0) return;
+      if (messages.length === 0) {
+        if (retries < 3) {
+          const delay = (retries + 1) * 1500; // 1.5s, 3s, 4.5s
+          console.log(
+            `[ShadowWrite] No messages found yet, retry ${retries + 1}/3 in ${delay}ms…`
+          );
+          setTimeout(() => this._captureAndSend(retries + 1), delay);
+        } else {
+          console.log("[ShadowWrite] No messages after 3 retries, waiting for MutationObserver.");
+        }
+        return;
+      }
       this.lastMessagesJson = JSON.stringify(messages);
       this._sendToService(messages);
     }
@@ -275,6 +374,7 @@
     _handleUrlChange() {
       // Reset state
       this.lastMessagesJson = "";
+      this.isTracking = false;
       if (this.contentObserver) {
         this.contentObserver.disconnect();
         this.contentObserver = null;
@@ -303,8 +403,8 @@
     /* -------------------------------------------------------------- */
 
     async _sendToService(messages) {
-      const endpoint =
-        `${this.settings.host}:${this.settings.port}${API_PATH}`;
+      if (!messages || messages.length === 0) return; // final guard
+
       const payload = {
         platform: this.platform,
         url: this.pageUrl,
@@ -314,25 +414,34 @@
       };
 
       try {
-        const resp = await fetch(endpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
+        // Relay through background service worker to bypass page CSP.
+        const resp = await chrome.runtime.sendMessage({
+          type: "sendToServer",
+          host: this.settings.host,
+          port: this.settings.port,
+          payload,
         });
-        if (!resp.ok) {
-          console.warn(
-            `[ShadowWrite] Server responded ${resp.status}: ${await resp.text()}`
+
+        if (resp && resp.ok) {
+          console.log(
+            `[ShadowWrite] Saved ${messages.length} messages → ${resp.body}`
           );
-        } else {
-          // Notify UI of success
           window.dispatchEvent(
             new CustomEvent("shadowwrite-save-success", {
               detail: { count: messages.length },
             })
           );
+        } else {
+          const errMsg = resp?.error || `Server responded ${resp?.status}: ${resp?.body?.substring(0, 120)}`;
+          console.warn(`[ShadowWrite] ${errMsg}`);
+          window.dispatchEvent(
+            new CustomEvent("shadowwrite-save-error", {
+              detail: { error: errMsg },
+            })
+          );
         }
       } catch (err) {
-        console.warn("[ShadowWrite] Cannot reach local service:", err.message);
+        console.warn("[ShadowWrite] Cannot reach background:", err.message);
         window.dispatchEvent(
           new CustomEvent("shadowwrite-save-error", {
             detail: { error: err.message },

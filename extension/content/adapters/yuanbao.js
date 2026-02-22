@@ -37,60 +37,60 @@
       const messages = [];
       let position = 0;
 
-      // User messages
-      const userEls = document.querySelectorAll(
-        ".agent-chat__list__item--human .hyc-content-text"
+      // querySelectorAll returns in DOM order — correctly interleaves
+      const allItems = document.querySelectorAll(
+        ".agent-chat__list__item--human, .agent-chat__list__item--ai"
       );
-      userEls.forEach((el) => {
-        messages.push({
-          messageId: this.generateMessageId("user", position),
-          sender: "user",
-          content: this.extractFormattedContent(el),
-          thinking: "",
-          position: position++,
-        });
-      });
 
-      // AI messages
-      const aiItems = document.querySelectorAll(
-        ".agent-chat__list__item--ai"
-      );
-      aiItems.forEach((item) => {
-        // Thinking
-        let thinking = "";
-        const thinkEl = item.querySelector(
-          ".hyc-component-reasoner__think-content"
-        );
-        if (thinkEl) {
-          const thinkText = thinkEl.querySelector(
+      allItems.forEach((item) => {
+        if (item.matches(".agent-chat__list__item--human")) {
+          const textEl = item.querySelector(".hyc-content-text");
+          if (textEl) {
+            messages.push({
+              messageId: this.generateMessageId("user", position),
+              sender: "user",
+              content: this.extractFormattedContent(textEl),
+              thinking: "",
+              position: position++,
+            });
+          }
+        } else {
+          // AI message
+          let thinking = "";
+          const thinkEl = item.querySelector(
+            ".hyc-component-reasoner__think-content"
+          );
+          if (thinkEl) {
+            const thinkText = thinkEl.querySelector(
+              ".hyc-component-reasoner__text"
+            );
+            if (thinkText) {
+              thinking = this.extractFormattedContent(thinkText);
+            }
+          }
+
+          // Main response text
+          const responseEl = item.querySelector(
             ".hyc-component-reasoner__text"
           );
-          if (thinkText) {
-            thinking = this.extractFormattedContent(thinkText);
+          let content = "";
+          if (responseEl && !responseEl.closest(".hyc-component-reasoner__think-content")) {
+            content = this.extractFormattedContent(responseEl);
           }
-        }
+          // Fallback: direct extraction from AI item
+          if (!content) {
+            content = this.extractFormattedContent(item);
+          }
 
-        // Main response text
-        const responseEl = item.querySelector(
-          ".hyc-component-reasoner__text"
-        );
-        let content = "";
-        if (responseEl && !responseEl.closest(".hyc-component-reasoner__think-content")) {
-          content = this.extractFormattedContent(responseEl);
-        }
-        // Fallback: direct extraction from AI item
-        if (!content) {
-          content = this.extractFormattedContent(item);
-        }
-
-        if (content) {
-          messages.push({
-            messageId: this.generateMessageId("AI", position),
-            sender: "AI",
-            content,
-            thinking,
-            position: position++,
-          });
+          if (content) {
+            messages.push({
+              messageId: this.generateMessageId("AI", position),
+              sender: "AI",
+              content,
+              thinking,
+              position: position++,
+            });
+          }
         }
       });
 

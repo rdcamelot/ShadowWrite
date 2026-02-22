@@ -189,19 +189,21 @@ ShadowWrite 的核心理念是**将 AI 对话实时持久化到本地文件**。
   - `MutationObserver`（childList + subtree + characterData）+ 1 秒 debounce
   - JSON 快照差异比较，仅发送增量消息
   - URL 轮询（1 秒）自动切换会话
-  - `fetch(POST)` 直接发送到本地 HTTP 服务
-- `content/content-common.js` — 状态指示器小圆点（idle/saving/ok/error）
+  - **HTTP 请求通过 background service worker 中继**（绕过页面 CSP 限制）
+  - **按对话粒度的追踪开关**（默认关闭，点击状态圆点开启）
+  - 追踪状态持久化到 `chrome.storage.local`，刷新页面保持
+- `content/content-common.js` — 状态指示器小圆点（可点击切换追踪）
 - `content/adapters/` — 7 个平台适配器：
   - `chatgpt.js` — ChatGPT/OpenAI
   - `deepseek.js` — DeepSeek（含 thinking 提取）
-  - `gemini.js` — Google Gemini
+  - `gemini.js` — Google Gemini（含智能标题提取）
   - `claude.js` — Anthropic Claude（含 thinking 过滤）
   - `kimi.js` — Kimi/Moonshot
   - `doubao.js` — 豆包（含 thinking 提取）
   - `yuanbao.js` — 腾讯元宝
-- `background/service-worker.js` — 设置管理、badge 更新、设置变更广播
+- `background/service-worker.js` — HTTP 中继（`sendToServer`）、设置管理、badge 更新
 - `popup/popup.html` + `popup.js` — 配置 UI（host/port/开关/连接测试）
-- `css/content.css` — 状态指示器样式
+- `css/content.css` — 状态指示器样式 + 追踪态白光效果
 
 **本地 HTTP 服务**（`shadowwrite_server.py`）：
 - 纯 stdlib，无第三方依赖
@@ -211,6 +213,7 @@ ShadowWrite 的核心理念是**将 AI 对话实时持久化到本地文件**。
 - 线程安全的会话状态管理（`ConversationState`）
 - `messageId` 幂等去重
 - CORS 支持
+- 输出文件夹 / 文件名优先使用会话标题（而非 conversationId）
 - 默认端口 `24601`，输出到 `./outputs/`
 
 #### 使用方法
@@ -249,29 +252,35 @@ curl.exe http://127.0.0.1:24601/api/health
 
 > 图标文件已预先生成（`extension/icons/icon{16,48,128}.png`），加载时不会报错。
 
-**第三步：打开 AI 平台对话**
+**第三步：打开 AI 平台，开启追踪**
 
-打开 ChatGPT / Claude / Gemini / DeepSeek / Kimi / 豆包 / 元宝任意支持的平台，进入对话。
+打开 ChatGPT / Claude / Gemini / DeepSeek / Kimi / 豆包 / 元宝任意平台，进入一个对话。
 
-扩展会在页面**右下角**显示一个小圆点状态指示器：
+页面**右下角**会出现一个小圆点：
 
-| 颜色 | 含义 |
-|------|------|
-| 灰色（暗） | 待机中 |
-| 橙色 | 正在发送到本地服务 |
-| 绿色（3 秒后消失） | 保存成功 |
-| 红色（持续） | 本地服务未启动或连接失败 |
+| 状态 | 外观 | 操作 |
+|------|------|------|
+| 未追踪（默认） | 灰色暗淡 | 点击 → 开启追踪 |
+| 追踪中 | **白色发光** | 点击 → 关闭追踪 |
+| 正在同步 | 橙色 | 自动 |
+| 同步成功 | 绿色（3 秒后恢复） | 自动 |
+| 连接失败 | 红色 | 检查本地服务是否运行 |
+
+> **按对话开关**：默认不追踪任何对话。只有你手动点击圆点开启的对话才会同步到本地。
+> 追踪状态持久化——刷新页面或重启浏览器后，之前开启的对话仍然保持追踪。
 
 **第四步：查看输出**
 
-每条对话保存到 `outputs/{platform}_{conversationId}/` 目录下：
+每条对话保存到 `outputs/{platform}_{title}/` 目录下：
 
 ```
 outputs/
-└── chatgpt_abc123/
-    ├── chatgpt_abc123.md           ← Markdown 主文档（可在 VS Code 直接编辑）
-    └── chatgpt_abc123.chat.html    ← 聊天视图（浏览器打开查看）
+└── gemini_炼金术与魔法学院/
+    ├── 炼金术与魔法学院.md           ← Markdown 主文档（可在 VS Code 直接编辑）
+    └── 炼金术与魔法学院.chat.html    ← 聊天视图（浏览器打开查看）
 ```
+
+> 输出文件名优先使用对话标题。如果标题不可用，回退到 `{platform}_{conversationId}`。
 
 #### 快速冒烟测试（不需要打开浏览器）
 
@@ -284,13 +293,21 @@ curl.exe -X POST http://127.0.0.1:24601/api/messages `
 # 预期：{"status": "ok", "written": 2, "skipped": 0, "conversationId": "test_001"}
 
 # 检查生成的文件
-Get-ChildItem outputs\chatgpt_test_001\
+Get-ChildItem outputs\chatgpt_测试对话\
 ```
+
+#### 已知限制
+
+- **懒加载**：Gemini 等平台对长对话使用虚拟滚动，插件只能抓取当前 DOM 中加载的消息。
+  开启追踪前，建议先手动滚动到对话顶部让所有消息加载完成。
+- **服务须手动启动**：当前需在终端手动运行 `python shadowwrite_server.py`。
+  自动启动（通过 Chrome Native Messaging）计划在 M2 实现。
 
 #### M1（下一步）
 
+- 自动启停本地服务（Chrome Native Messaging + 系统注册）
+- 首次追踪时自动滚动加载完整对话历史
 - 多轮去重优化（基于内容 hash 而非仅 position）
-- 扩展 popup 显示当前会话列表
 - 消息格式与 CLI 对齐（统一 turn 元数据格式）
 - CSS 选择器热更新机制（应对平台前端变更）
 

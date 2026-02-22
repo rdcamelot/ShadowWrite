@@ -69,6 +69,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       chrome.storage.sync.set(message.settings);
       break;
 
+    // Content script asks background to relay HTTP to local server
+    // (background fetch is NOT subject to page CSP)
+    case "sendToServer":
+      (async () => {
+        try {
+          let host = message.host || "http://127.0.0.1";
+          if (!/^https?:\/\//i.test(host)) {
+            host = `http://${host}`;
+          }
+          const url = `${host}:${message.port || 24601}/api/messages`;
+          const resp = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(message.payload),
+          });
+          const body = await resp.text();
+          sendResponse({ ok: resp.ok, status: resp.status, body });
+        } catch (err) {
+          sendResponse({ ok: false, error: err.message });
+        }
+      })();
+      return true; // keep message channel open for async sendResponse
+
     default:
       console.warn("[ShadowWrite] Unknown message type:", message.type);
   }

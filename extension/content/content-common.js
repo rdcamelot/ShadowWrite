@@ -23,7 +23,22 @@
 
     const dot = document.createElement("div");
     dot.id = STATUS_ID;
-    dot.title = "ShadowWrite: idle";
+    dot.title = "ShadowWrite: click to toggle tracking";
+
+    // Click to toggle tracking on/off for current conversation
+    dot.addEventListener("click", () => {
+      const adapter = window.__shadowWriteAdapter;
+      if (!adapter || !adapter.currentConversationId) {
+        console.log("[ShadowWrite] No active conversation to track.");
+        return;
+      }
+      if (adapter.isTracking) {
+        adapter.disableTracking();
+      } else {
+        adapter.enableTracking();
+      }
+    });
+
     document.body.appendChild(dot);
   }
 
@@ -31,8 +46,8 @@
     const dot = document.getElementById(STATUS_ID);
     if (!dot) return;
 
+    // Remove transient state classes (keep sw-tracking!)
     dot.classList.remove(
-      "sw-status-idle",
       "sw-status-saving",
       "sw-status-ok",
       "sw-status-error"
@@ -40,8 +55,10 @@
 
     switch (state) {
       case "idle":
-        dot.classList.add("sw-status-idle");
-        dot.title = "ShadowWrite: idle";
+        // Just remove transient classes; tracking class stays
+        dot.title = dot.classList.contains("sw-tracking")
+          ? "ShadowWrite: tracking ON (click to stop)"
+          : "ShadowWrite: tracking OFF (click to start)";
         break;
       case "saving":
         dot.classList.add("sw-status-saving");
@@ -50,13 +67,11 @@
       case "ok":
         dot.classList.add("sw-status-ok");
         dot.title = `ShadowWrite: saved (${detail || ""})`;
-        // Revert to idle after 3s
         setTimeout(() => setStatus("idle"), 3000);
         break;
       case "error":
         dot.classList.add("sw-status-error");
         dot.title = `ShadowWrite: error — ${detail || "unknown"}`;
-        // Revert to idle after 8s
         setTimeout(() => setStatus("idle"), 8000);
         break;
     }
@@ -72,6 +87,26 @@
 
   window.addEventListener("shadowwrite-save-error", (e) => {
     setStatus("error", e.detail?.error);
+  });
+
+  // Tracking state toggle — update dot appearance
+  window.addEventListener("shadowwrite-tracking-state", (e) => {
+    const dot = document.getElementById(STATUS_ID);
+    if (!dot) return;
+    const { tracking, hasConversation } = e.detail || {};
+    if (!hasConversation) {
+      // Not on a valid conversation page
+      dot.classList.remove("sw-tracking");
+      dot.title = "ShadowWrite: not a conversation page";
+      return;
+    }
+    if (tracking) {
+      dot.classList.add("sw-tracking");
+      dot.title = "ShadowWrite: tracking ON (click to stop)";
+    } else {
+      dot.classList.remove("sw-tracking");
+      dot.title = "ShadowWrite: tracking OFF (click to start)";
+    }
   });
 
   /* ------------------------------------------------------------------ */

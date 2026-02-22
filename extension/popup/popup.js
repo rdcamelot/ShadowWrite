@@ -69,8 +69,13 @@ async function testConnection(host, port) {
   statusEl.className = "status";
   statusEl.textContent = "正在连接...";
 
+  // Ensure protocol prefix
+  if (!/^https?:\/\//i.test(host)) {
+    host = `http://${host}`;
+  }
+
   try {
-    const resp = await fetch(`http://${host}:${port}/api/health`, {
+    const resp = await fetch(`${host}:${port}/api/health`, {
       method: "GET",
       signal: AbortSignal.timeout(3000),
     });
