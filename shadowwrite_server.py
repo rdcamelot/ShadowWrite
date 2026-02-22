@@ -352,9 +352,15 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
         # Resolve output paths
         meta = self.state.get_meta(conversation_id)
         if meta is None:
-            safe_name = sanitize_filename(f"{platform}_{conversation_id}")
-            md_path = self.output_dir / safe_name / f"{safe_name}.md"
-            html_path = self.output_dir / safe_name / f"{safe_name}.chat.html"
+            # Prefer conversation title for file naming, fall back to platform_id
+            if title and title.strip():
+                display_name = sanitize_filename(title.strip())
+            else:
+                display_name = sanitize_filename(f"{platform}_{conversation_id}")
+            # Ensure uniqueness: directory uses platform prefix + display_name
+            dir_name = sanitize_filename(f"{platform}_{display_name}")
+            md_path = self.output_dir / dir_name / f"{display_name}.md"
+            html_path = self.output_dir / dir_name / f"{display_name}.chat.html"
 
             ensure_output_file(md_path, platform, title)
             ensure_html_file(html_path, title)
@@ -473,10 +479,12 @@ def main() -> int:
 
     server = HTTPServer((args.host, args.port), handler_class)
 
-    # Graceful shutdown
+    # Graceful shutdown — must call server.shutdown() from a *different* thread.
+    # Calling it directly in the signal handler (main thread) deadlocks because
+    # serve_forever() is also running in the main thread and can't advance.
     def shutdown_handler(sig, frame):
         print("\n[ShadowWrite] Shutting down...")
-        server.shutdown()
+        threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)

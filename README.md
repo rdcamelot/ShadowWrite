@@ -18,8 +18,6 @@
 * **非实时：** 只能手动点击触发，每次都会生成一个全新的文件，无法与你正在编辑的文档双向同步。
 * **虚拟滚动（懒加载）陷阱：** 如果你的小说对话拉得很长，网页为了节省内存会把上面的对话从 DOM 里删掉。插件抓不到不在屏幕上的内容，导致你的长篇大论直接丢失。
 
-
-
 ---
 
 ## 2. 官方 API + 纯本地脚本（“硬核全场景”流）
@@ -215,16 +213,78 @@ ShadowWrite 的核心理念是**将 AI 对话实时持久化到本地文件**。
 - CORS 支持
 - 默认端口 `24601`，输出到 `./outputs/`
 
-#### 用法
+#### 使用方法
+
+**第一步：启动本地 HTTP 服务**
 
 ```bash
-# 1. 启动本地 HTTP 服务
+cd d:\code\ShadowWrite
 python shadowwrite_server.py
+```
 
-# 2. 在 Chrome 中加载扩展
-#    chrome://extensions → 开发者模式 → 加载已解压的扩展程序 → 选择 extension/ 目录
+看到以下输出说明成功：
 
-# 3. 打开任意支持的 AI 平台对话，扩展自动捕获并发送到本地服务
+```
+╔══════════════════════════════════════════════════════════════╗
+║  ShadowWrite Local Server                                    ║
+║  Listening:   http://127.0.0.1:24601                        ║
+║  ...                                                         ║
+║  Press Ctrl+C to stop                                        ║
+╚══════════════════════════════════════════════════════════════╝
+```
+
+验证服务正常（PowerShell 中 `curl` 是 `Invoke-WebRequest` 的别名，建议用 `curl.exe`）：
+
+```powershell
+curl.exe http://127.0.0.1:24601/api/health
+# 预期返回：{"status": "ok", "service": "ShadowWrite", "version": "0.1.0"}
+```
+
+**第二步：加载 Chrome 扩展**
+
+1. 打开 `chrome://extensions`
+2. 右上角开启**开发者模式**
+3. 点击**"加载已解压的扩展程序"**
+4. 选择 `extension/` 目录
+
+> 图标文件已预先生成（`extension/icons/icon{16,48,128}.png`），加载时不会报错。
+
+**第三步：打开 AI 平台对话**
+
+打开 ChatGPT / Claude / Gemini / DeepSeek / Kimi / 豆包 / 元宝任意支持的平台，进入对话。
+
+扩展会在页面**右下角**显示一个小圆点状态指示器：
+
+| 颜色 | 含义 |
+|------|------|
+| 灰色（暗） | 待机中 |
+| 橙色 | 正在发送到本地服务 |
+| 绿色（3 秒后消失） | 保存成功 |
+| 红色（持续） | 本地服务未启动或连接失败 |
+
+**第四步：查看输出**
+
+每条对话保存到 `outputs/{platform}_{conversationId}/` 目录下：
+
+```
+outputs/
+└── chatgpt_abc123/
+    ├── chatgpt_abc123.md           ← Markdown 主文档（可在 VS Code 直接编辑）
+    └── chatgpt_abc123.chat.html    ← 聊天视图（浏览器打开查看）
+```
+
+#### 快速冒烟测试（不需要打开浏览器）
+
+```powershell
+# 模拟一条来自扩展的对话数据
+curl.exe -X POST http://127.0.0.1:24601/api/messages `
+  -H "Content-Type: application/json" `
+  -d '{\"platform\":\"chatgpt\",\"conversationId\":\"test_001\",\"title\":\"测试对话\",\"url\":\"https://chatgpt.com/c/test_001\",\"messages\":[{\"messageId\":\"msg_001\",\"sender\":\"user\",\"content\":\"你好\",\"thinking\":\"\",\"position\":0},{\"messageId\":\"msg_002\",\"sender\":\"AI\",\"content\":\"你好！有什么可以帮你的？\",\"thinking\":\"\",\"position\":1}]}'
+
+# 预期：{"status": "ok", "written": 2, "skipped": 0, "conversationId": "test_001"}
+
+# 检查生成的文件
+Get-ChildItem outputs\chatgpt_test_001\
 ```
 
 #### M1（下一步）
