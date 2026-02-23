@@ -13,8 +13,11 @@ Environment variables (or .env file in CWD / script directory):
     SHADOWWRITE_SERVER_PORT      Port to listen on (default: 24601)
     SHADOWWRITE_SERVER_HOST      Host to bind (default: 127.0.0.1)
     SHADOWWRITE_OUTPUT_DIR       Output directory (default: ./outputs)
+    SHADOWWRITE_SERVER_CHAT_HTML  Whether to generate .chat.html files (default: true)
 
 Requires: Python 3.10+, stdlib only
+
+python shadowwrite_server.py
 """
 
 from __future__ import annotations
@@ -64,20 +67,40 @@ class ConversationState:
 
     def __init__(self):
         self._lock = threading.Lock()
-        # { conversationId: { messageId: True } }
-        self._written: Dict[str, Dict[str, bool]] = {}
+        # { conversationId: { messageId: {content, thinking, md_offset, html_offset, turn_id} } }
+        self._written: Dict[str, Dict[str, Dict[str, Any]]] = {}
         # { conversationId: next_turn_id }
         self._turn_ids: Dict[str, int] = {}
         # { conversationId: { platform, title, output_path, html_path } }
         self._meta: Dict[str, Dict[str, Any]] = {}
 
+    def get_written(self, conversation_id: str, message_id: str) -> Dict[str, Any] | None:
+        """Return stored write-record or None if not yet written."""
+        with self._lock:
+            return self._written.get(conversation_id, {}).get(message_id)
+
     def is_written(self, conversation_id: str, message_id: str) -> bool:
         with self._lock:
             return message_id in self._written.get(conversation_id, {})
 
-    def mark_written(self, conversation_id: str, message_id: str) -> None:
+    def mark_written(
+        self,
+        conversation_id: str,
+        message_id: str,
+        content: str,
+        thinking: str,
+        md_offset: int,
+        html_offset: int,
+        turn_id: int,
+    ) -> None:
         with self._lock:
-            self._written.setdefault(conversation_id, {})[message_id] = True
+            self._written.setdefault(conversation_id, {})[message_id] = {
+                "content": content,
+                "thinking": thinking,
+                "md_offset": md_offset,
+                "html_offset": html_offset,
+                "turn_id": turn_id,
+            }
 
     def next_turn_id(self, conversation_id: str) -> int:
         with self._lock:
@@ -92,6 +115,12 @@ class ConversationState:
     def set_meta(self, conversation_id: str, meta: Dict[str, Any]) -> None:
         with self._lock:
             self._meta[conversation_id] = meta
+
+    def clear_conversation(self, conversation_id: str) -> None:
+        """Reset written-IDs and turn counter for a conversation (keep meta)."""
+        with self._lock:
+            self._written.pop(conversation_id, None)
+            self._turn_ids.pop(conversation_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +180,22 @@ def quote_markdown(text: str) -> str:
     if not lines:
         return "> "
     return "\n".join(f"> {line}" if line else ">" for line in lines)
+
+
+def truncate_file(path: Path, offset: int) -> None:
+    """Truncate *path* back to *offset* bytes (for streaming upsert)."""
+    if not path.exists():
+        return
+    with path.open("r+b") as fh:
+        fh.truncate(offset)
+
+
+def file_end(path: Path) -> int:
+    """Return current EOF byte offset, 0 if file does not exist."""
+    try:
+        return path.stat().st_size
+    except FileNotFoundError:
+        return 0
 
 
 def format_details_body(text: str) -> str:
@@ -369,13 +414,15 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
                 display_name = sanitize_filename(title.strip())
             else:
                 display_name = sanitize_filename(f"{platform}_{conversation_id}")
-            # Ensure uniqueness: directory uses platform prefix + display_name
-            dir_name = sanitize_filename(f"{platform}_{display_name}")
-            md_path = self.output_dir / dir_name / f"{display_name}.md"
-            html_path = self.output_dir / dir_name / f"{display_name}.chat.html"
+            # Directory: {output_dir}/{platform}/{display_name}/
+            dir_name = sanitize_filename(platform)
+            sub_name = sanitize_filename(display_name)
+            md_path = self.output_dir / dir_name / sub_name / f"{display_name}.md"
+            html_path = self.output_dir / dir_name / sub_name / f"{display_name}.chat.html"
 
             ensure_output_file(md_path, platform, title)
-            ensure_html_file(html_path, title)
+            if self.chat_html:
+                ensure_html_file(html_path, title)
 
             meta = {
                 "platform": platform,
@@ -393,45 +440,79 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
                 meta["title"] = title
                 self.state.set_meta(conversation_id, meta)
 
-        # Process messages — only write new ones
+            # If output files were deleted externally, reset state so
+            # messages are re-written from scratch on next snapshot.
+            if not md_path.exists():
+                self.log_message(
+                    "  [!] Output file missing for %s — resetting state",
+                    conversation_id[:16],
+                )
+                self.state.clear_conversation(conversation_id)
+                ensure_output_file(md_path, platform, title)
+                if self.chat_html:
+                    ensure_html_file(html_path, title)
+
+        # Process messages — only write new ones; upsert on streaming updates
         written_count = 0
         skipped_count = 0
+        updated_count = 0
 
         for msg in messages:
             msg_id = msg.get("messageId", "")
             if not msg_id:
                 continue
 
-            if self.state.is_written(conversation_id, msg_id):
-                skipped_count += 1
-                continue
-
-            sender = msg.get("sender", "")
+            sender  = msg.get("sender", "")
             content = msg.get("content", "")
             thinking = msg.get("thinking", "")
 
             if not content:
                 continue
 
-            turn_id = self.state.next_turn_id(conversation_id)
+            prev = self.state.get_written(conversation_id, msg_id)
+
+            if prev is not None:
+                # Already written — check whether content changed (streaming update)
+                if prev["content"] == content and prev["thinking"] == thinking:
+                    skipped_count += 1
+                    continue
+                # Content changed: truncate files back to the saved offset and rewrite
+                turn_id = prev["turn_id"]
+                truncate_file(md_path, prev["md_offset"])
+                if self.chat_html:
+                    truncate_file(html_path, prev["html_offset"])
+                updated_count += 1
+            else:
+                turn_id = self.state.next_turn_id(conversation_id)
+                written_count += 1
+
+            md_off   = file_end(md_path)
+            html_off = file_end(html_path) if self.chat_html else 0
 
             if sender.lower() in ("user",):
                 append_user_turn(md_path, content, turn_id)
-                append_html_user_turn(html_path, content, turn_id)
+                if self.chat_html:
+                    append_html_user_turn(html_path, content, turn_id)
             else:
                 append_assistant_turn(md_path, content, thinking, turn_id)
-                append_html_assistant_turn(html_path, content, thinking, turn_id)
+                if self.chat_html:
+                    append_html_assistant_turn(html_path, content, thinking, turn_id)
 
-            self.state.mark_written(conversation_id, msg_id)
-            written_count += 1
+            self.state.mark_written(
+                conversation_id, msg_id, content, thinking,
+                md_off, html_off, turn_id,
+            )
             self.log_message(
-                "  %s turn %d: %s (%d chars)",
-                sender, turn_id, conversation_id[:16], len(content),
+                "  %s turn %d %s: %s (%d chars)",
+                sender, turn_id,
+                "(update)" if prev is not None else "",
+                conversation_id[:16], len(content),
             )
 
         self._send_json(200, {
             "status": "ok",
             "written": written_count,
+            "updated": updated_count,
             "skipped": skipped_count,
             "conversationId": conversation_id,
         })
@@ -441,7 +522,7 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
 # Server setup
 # ---------------------------------------------------------------------------
 
-def create_handler_class(state: ConversationState, output_dir: Path):
+def create_handler_class(state: ConversationState, output_dir: Path, chat_html: bool = True):
     """Create handler class with shared state."""
 
     class Handler(ShadowWriteHandler):
@@ -449,6 +530,7 @@ def create_handler_class(state: ConversationState, output_dir: Path):
 
     Handler.state = state
     Handler.output_dir = output_dir
+    Handler.chat_html = chat_html
     return Handler
 
 
@@ -473,6 +555,12 @@ def parse_args() -> argparse.Namespace:
         default=Path(os.environ.get("SHADOWWRITE_OUTPUT_DIR", "./outputs")),
         help="Directory for output files (default: ./outputs)",
     )
+    parser.add_argument(
+        "--no-html",
+        action="store_true",
+        default=os.environ.get("SHADOWWRITE_SERVER_CHAT_HTML", "true").lower() == "false",
+        help="Disable .chat.html file generation",
+    )
     return parser.parse_args()
 
 
@@ -487,7 +575,8 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     state = ConversationState()
-    handler_class = create_handler_class(state, output_dir)
+    chat_html = not args.no_html
+    handler_class = create_handler_class(state, output_dir, chat_html)
 
     server = HTTPServer((args.host, args.port), handler_class)
 
@@ -507,6 +596,7 @@ def main() -> int:
 ║                                                              ║
 ║  Listening:   http://{args.host}:{args.port}               ║
 ║  Output dir:  {str(output_dir):<45s}║
+║  Chat HTML:   {'ON' if chat_html else 'OFF':<45s}║
 ║  Health:      GET  /api/health                               ║
 ║  Messages:    POST /api/messages                             ║
 ║                                                              ║

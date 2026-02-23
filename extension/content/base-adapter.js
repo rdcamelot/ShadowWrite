@@ -21,6 +21,7 @@
   /* ------------------------------------------------------------------ */
 
   const DEBOUNCE_DELAY = 1000;            // ms after last DOM change
+  const THROTTLE_INTERVAL = 3000;         // max wait during continuous DOM changes
   const URL_POLL_INTERVAL = 1000;         // ms between URL polls
   const DEFAULT_HOST = "127.0.0.1";
   const DEFAULT_PORT = 24601;
@@ -43,10 +44,12 @@
       this.lastMessagesJson = "";          // serialised snapshot for diff
       this.lastKnownUrl = location.href.split("?")[0];
       this.isTracking = false;             // per-conversation tracking toggle
+      this._epoch = 0;                     // incremented on URL change; stale timers check this
 
       // Observers / timers
       this.contentObserver = null;
       this.debounceTimer = null;
+      this.throttleTimer = null;           // max-wait during streaming
       this.urlCheckInterval = null;
 
       // Settings (loaded from chrome.storage.sync)
@@ -248,6 +251,8 @@
       }
 
       this.isTracking = true;
+      // Clear snapshot cache so _captureAndSend always sends a fresh snapshot
+      this.lastMessagesJson = "";
       window.dispatchEvent(new CustomEvent("shadowwrite-tracking-state", {
         detail: { tracking: true, hasConversation: true, conversationId: this.currentConversationId },
       }));
@@ -331,10 +336,27 @@
     }
 
     _debouncedCapture() {
+      const epoch = this._epoch;
+      // Trailing edge — resets on every mutation
       if (this.debounceTimer) clearTimeout(this.debounceTimer);
-      this.debounceTimer = setTimeout(() => {
-        this._checkForChanges();
-      }, DEBOUNCE_DELAY);
+      this.debounceTimer = setTimeout(() => this._flushCapture(epoch), DEBOUNCE_DELAY);
+
+      // Throttle — fires at most every THROTTLE_INTERVAL even if
+      // mutations keep coming (e.g. during AI streaming output).
+      if (!this.throttleTimer) {
+        this.throttleTimer = setTimeout(() => this._flushCapture(epoch), THROTTLE_INTERVAL);
+      }
+    }
+
+    /**
+     * Execute capture and clear both timers.
+     */
+    _flushCapture(epoch) {
+      // Stale timer from a previous conversation — discard silently
+      if (epoch !== undefined && epoch !== this._epoch) return;
+      if (this.debounceTimer)  { clearTimeout(this.debounceTimer);  this.debounceTimer  = null; }
+      if (this.throttleTimer) { clearTimeout(this.throttleTimer); this.throttleTimer = null; }
+      this._checkForChanges();
     }
 
     /**
@@ -361,7 +383,12 @@
      * Capture current messages and send without diff check (initial load).
      * Retries up to 3 times if DOM is not ready yet.
      */
-    _captureAndSend(retries = 0) {
+    _captureAndSend(retries = 0, epoch) {
+      // Capture epoch on first call so retries are bound to this conversation
+      if (epoch === undefined) epoch = this._epoch;
+      // Stale retry from a previous conversation — discard
+      if (epoch !== this._epoch) return;
+
       const messages = this.extractMessages();
       if (messages.length === 0) {
         if (retries < 3) {
@@ -369,7 +396,7 @@
           console.log(
             `[ShadowWrite] No messages found yet, retry ${retries + 1}/3 in ${delay}ms…`
           );
-          setTimeout(() => this._captureAndSend(retries + 1), delay);
+          setTimeout(() => this._captureAndSend(retries + 1, epoch), delay);
         } else {
           console.log("[ShadowWrite] No messages after 3 retries, waiting for MutationObserver.");
         }
@@ -398,6 +425,9 @@
     }
 
     _handleUrlChange() {
+      // Bump epoch — all pending timers from the old conversation become stale
+      this._epoch++;
+
       // Reset state
       this.lastMessagesJson = "";
       this.isTracking = false;
@@ -405,8 +435,16 @@
         this.contentObserver.disconnect();
         this.contentObserver = null;
       }
+      // Clear pending capture timers
+      if (this.debounceTimer)  { clearTimeout(this.debounceTimer);  this.debounceTimer  = null; }
+      if (this.throttleTimer) { clearTimeout(this.throttleTimer); this.throttleTimer = null; }
 
-      // Re-initialise for new conversation
+      // Immediately update dot to OFF so user sees instant feedback
+      window.dispatchEvent(new CustomEvent("shadowwrite-tracking-state", {
+        detail: { tracking: false, hasConversation: false },
+      }));
+
+      // Re-initialise for new conversation (allow DOM to settle)
       setTimeout(() => this._init(), 500);
     }
 
@@ -489,17 +527,218 @@
     }
 
     /**
-     * Extract visible text from an element, cleaning extra whitespace.
+     * Extract content from an element and convert HTML to Markdown,
+     * preserving headings, bold/italic, lists, code blocks, tables, etc.
      */
     extractFormattedContent(element) {
       if (!element) return "";
       // Clone to avoid side effects
       const clone = element.cloneNode(true);
       // Remove hidden/script elements
-      clone.querySelectorAll("script, style, .sr-only").forEach((el) => el.remove());
-      return (clone.innerText || clone.textContent || "")
-        .replace(/\n{3,}/g, "\n\n")
-        .trim();
+      clone
+        .querySelectorAll("script, style, .sr-only")
+        .forEach((el) => el.remove());
+      return this._htmlToMarkdown(clone);
+    }
+
+    /**
+     * Lightweight HTML-to-Markdown converter.
+     * Handles: headings, bold, italic, strikethrough, inline code,
+     * fenced code blocks, links, images, lists (nested), paragraphs,
+     * blockquotes, horizontal rules, and tables.
+     */
+    _htmlToMarkdown(root) {
+      const self = this;
+
+      function processNode(node) {
+        if (node.nodeType === Node.TEXT_NODE) {
+          return node.textContent;
+        }
+        if (node.nodeType !== Node.ELEMENT_NODE) return "";
+
+        const tag = node.tagName.toLowerCase();
+        const children = () =>
+          Array.from(node.childNodes).map(processNode).join("");
+
+        switch (tag) {
+          // --- Headings ---
+          case "h1":
+          case "h2":
+          case "h3":
+          case "h4":
+          case "h5":
+          case "h6": {
+            const level = parseInt(tag[1]);
+            return (
+              "\n\n" + "#".repeat(level) + " " + children().trim() + "\n\n"
+            );
+          }
+          // --- Inline formatting ---
+          case "strong":
+          case "b":
+            return "**" + children() + "**";
+          case "em":
+          case "i":
+            return "*" + children() + "*";
+          case "del":
+          case "s":
+            return "~~" + children() + "~~";
+          case "mark":
+            return "==" + children() + "==";
+          case "sub":
+            return "~" + children() + "~";
+          case "sup":
+            return "^" + children() + "^";
+          // --- Code ---
+          case "code": {
+            // If inside <pre>, handled by 'pre' case
+            if (
+              node.parentElement &&
+              node.parentElement.tagName.toLowerCase() === "pre"
+            ) {
+              return node.textContent;
+            }
+            return "`" + node.textContent + "`";
+          }
+          case "pre": {
+            const codeEl = node.querySelector("code");
+            const lang = codeEl
+              ? (codeEl.className.match(/(?:language|lang|highlight)-(\S+)/i)?.[1] || "")
+              : "";
+            const code = codeEl ? codeEl.textContent : node.textContent;
+            return (
+              "\n\n```" + lang + "\n" + code.replace(/\n$/, "") + "\n```\n\n"
+            );
+          }
+          // --- Links & images ---
+          case "a": {
+            const href = node.getAttribute("href") || "";
+            const text = children();
+            return href ? "[" + text + "](" + href + ")" : text;
+          }
+          case "img": {
+            const alt = node.getAttribute("alt") || "";
+            const src = node.getAttribute("src") || "";
+            return "![" + alt + "](" + src + ")";
+          }
+          // --- Lists ---
+          case "ul":
+          case "ol":
+            return "\n" + self._processListItems(node, "") + "\n";
+          // --- Block elements ---
+          case "p":
+            return "\n\n" + children().trim() + "\n\n";
+          case "br":
+            return "\n";
+          case "hr":
+            return "\n\n---\n\n";
+          case "blockquote": {
+            const content = children().trim();
+            return (
+              "\n\n" +
+              content
+                .split("\n")
+                .map((l) => "> " + l)
+                .join("\n") +
+              "\n\n"
+            );
+          }
+          // --- Tables ---
+          case "table":
+            return "\n\n" + self._processTable(node) + "\n\n";
+          // --- Math (KaTeX / MathJax) ---
+          case "math": {
+            const tex =
+              node.getAttribute("alttext") ||
+              node.getAttribute("data-latex") ||
+              node.textContent;
+            return "$" + tex + "$";
+          }
+          // --- Pass-through containers ---
+          default:
+            return children();
+        }
+      }
+
+      return processNode(root).replace(/\n{3,}/g, "\n\n").trim();
+    }
+
+    /**
+     * Process <ul>/<ol> items with proper nesting and indentation.
+     */
+    _processListItems(listNode, indent) {
+      const isOrdered = listNode.tagName.toLowerCase() === "ol";
+      let result = "";
+      let idx = 0;
+
+      for (const child of listNode.children) {
+        if (child.tagName.toLowerCase() !== "li") continue;
+        idx++;
+        const prefix = isOrdered ? `${idx}. ` : "- ";
+        const continuation = " ".repeat(prefix.length);
+
+        let inlineContent = "";
+        let nestedBlocks = "";
+
+        for (const liChild of child.childNodes) {
+          if (liChild.nodeType === Node.ELEMENT_NODE) {
+            const liTag = liChild.tagName.toLowerCase();
+            if (liTag === "ul" || liTag === "ol") {
+              nestedBlocks += this._processListItems(
+                liChild,
+                indent + continuation
+              );
+              continue;
+            }
+          }
+          inlineContent += this._htmlToMarkdown(liChild);
+        }
+
+        // First line gets the bullet, subsequent lines get continuation indent
+        const trimmed = inlineContent.trim();
+        if (trimmed) {
+          const lines = trimmed.split("\n");
+          result += indent + prefix + lines[0];
+          for (let i = 1; i < lines.length; i++) {
+            if (lines[i].trim()) {
+              result += "\n" + indent + continuation + lines[i];
+            }
+          }
+          result += "\n";
+        }
+
+        if (nestedBlocks) {
+          result += nestedBlocks;
+        }
+      }
+
+      return result;
+    }
+
+    /**
+     * Process <table> into Markdown pipe table.
+     */
+    _processTable(tableNode) {
+      const rows = tableNode.querySelectorAll("tr");
+      if (rows.length === 0) return "";
+
+      let result = "";
+      let isFirst = true;
+
+      for (const row of rows) {
+        const cells = Array.from(row.querySelectorAll("th, td"));
+        const cellTexts = cells.map((c) =>
+          this._htmlToMarkdown(c).trim().replace(/\|/g, "\\|").replace(/\n/g, " ")
+        );
+        result += "| " + cellTexts.join(" | ") + " |\n";
+
+        if (isFirst) {
+          result += "| " + cellTexts.map(() => "---").join(" | ") + " |\n";
+          isFirst = false;
+        }
+      }
+
+      return result;
     }
 
     /**
@@ -517,6 +756,7 @@
     destroy() {
       if (this.contentObserver) this.contentObserver.disconnect();
       if (this.debounceTimer) clearTimeout(this.debounceTimer);
+      if (this.throttleTimer) clearTimeout(this.throttleTimer);
       if (this.urlCheckInterval) clearInterval(this.urlCheckInterval);
     }
   }
