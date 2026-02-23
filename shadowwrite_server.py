@@ -153,18 +153,30 @@ def quote_markdown(text: str) -> str:
     return "\n".join(f"> {line}" if line else ">" for line in lines)
 
 
+def format_details_body(text: str) -> str:
+    """Typora-friendly details body: escape HTML, use <br> for newlines."""
+    lines = text.strip().splitlines()
+    if not lines:
+        return ""
+    return "<br>\n".join(html_escape(line) for line in lines)
+
+
 def append_user_turn(path: Path, content: str, turn_id: int) -> None:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     meta = (
         f'<!-- sw: turn="{turn_id}" role="user" ts="{stamp}" -->\n'
         f'<a id="sw-turn-{turn_id}"></a>\n'
     )
+    anchor_href = f"#sw-turn-{turn_id}"
+    tooltip = f"sw: role=user | ts={stamp}"
+    summary = "User Input"
+    details_body = format_details_body(content)
     block = (
         "\n\n---\n\n"
         f"{meta}"
-        f"[User Input - {stamp}](#sw-turn-{turn_id} "
-        f'"sw: role=user | ts={stamp}")\n\n'
-        f"{quote_markdown(content)}\n"
+        '<details class="sw-user-turn"><summary>'
+        f'<strong><a href="{anchor_href}" title="{html_escape(tooltip)}">{html_escape(summary)}</a></strong>'
+        f'</summary>{details_body}</details>\n'
     )
     with path.open("a", encoding="utf-8") as fh:
         fh.write(block)
@@ -180,7 +192,7 @@ def append_assistant_turn(path: Path, content: str, thinking: str, turn_id: int)
     parts = [
         "\n\n",
         meta,
-        f'[Assistant - {stamp}](#sw-turn-{turn_id} '
+        f'[Assistant](#sw-turn-{turn_id} '
         f'"sw: role=assistant | ts={stamp}")\n\n',
     ]
 

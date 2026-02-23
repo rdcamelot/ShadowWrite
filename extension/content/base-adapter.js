@@ -24,6 +24,7 @@
   const URL_POLL_INTERVAL = 1000;         // ms between URL polls
   const DEFAULT_HOST = "127.0.0.1";
   const DEFAULT_PORT = 24601;
+  const CONTEXT_INVALIDATED_MSG = "Extension context invalidated";
 
   /* ------------------------------------------------------------------ */
   /*  BaseShadowWriteAdapter                                             */
@@ -55,6 +56,29 @@
         autoCapture: true,
         enabled: true,
       };
+
+      this._contextInvalidated = false;
+    }
+
+    /* ==============================================================
+     *  Context validation
+     * ============================================================== */
+
+    /**
+     * Check if an error indicates the extension context has been invalidated
+     * (e.g. user reloaded the extension without refreshing the page).
+     */
+    _handleContextInvalidated(err) {
+      if (err && String(err.message || err).includes(CONTEXT_INVALIDATED_MSG)) {
+        if (!this._contextInvalidated) {
+          this._contextInvalidated = true;
+          console.warn("[ShadowWrite] Extension context invalidated — please refresh the page.");
+          this.destroy();
+          window.dispatchEvent(new CustomEvent("shadowwrite-context-invalidated"));
+        }
+        return true;
+      }
+      return false;
     }
 
     /* ==============================================================
@@ -208,7 +232,7 @@
      * Enable tracking for the current conversation.
      */
     async enableTracking() {
-      if (!this.currentConversationId) return;
+      if (!this.currentConversationId || this._contextInvalidated) return;
       try {
         const data = await chrome.storage.local.get({ trackedConversations: {} });
         data.trackedConversations[this.currentConversationId] = {
@@ -219,6 +243,7 @@
         };
         await chrome.storage.local.set(data);
       } catch (err) {
+        if (this._handleContextInvalidated(err)) return;
         console.warn("[ShadowWrite] Failed to save tracking state:", err);
       }
 
@@ -236,12 +261,13 @@
      * Disable tracking for the current conversation.
      */
     async disableTracking() {
-      if (!this.currentConversationId) return;
+      if (!this.currentConversationId || this._contextInvalidated) return;
       try {
         const data = await chrome.storage.local.get({ trackedConversations: {} });
         delete data.trackedConversations[this.currentConversationId];
         await chrome.storage.local.set(data);
       } catch (err) {
+        if (this._handleContextInvalidated(err)) return;
         console.warn("[ShadowWrite] Failed to save tracking state:", err);
       }
 
@@ -441,6 +467,7 @@
           );
         }
       } catch (err) {
+        if (this._handleContextInvalidated(err)) return;
         console.warn("[ShadowWrite] Cannot reach background:", err.message);
         window.dispatchEvent(
           new CustomEvent("shadowwrite-save-error", {

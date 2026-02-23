@@ -28,7 +28,15 @@
     // Click to toggle tracking on/off for current conversation
     dot.addEventListener("click", () => {
       const adapter = window.__shadowWriteAdapter;
-      if (!adapter || !adapter.currentConversationId) {
+      if (!adapter) return;
+      if (adapter._contextInvalidated) {
+        // Extension was reloaded — refreshing is the only fix
+        if (confirm("ShadowWrite 扩展已更新，需要刷新页面才能继续使用。\n\n立即刷新？")) {
+          location.reload();
+        }
+        return;
+      }
+      if (!adapter.currentConversationId) {
         console.log("[ShadowWrite] No active conversation to track.");
         return;
       }
@@ -87,6 +95,15 @@
 
   window.addEventListener("shadowwrite-save-error", (e) => {
     setStatus("error", e.detail?.error);
+  });
+
+  // Extension context invalidated — show red dot with refresh prompt
+  window.addEventListener("shadowwrite-context-invalidated", () => {
+    const dot = document.getElementById(STATUS_ID);
+    if (!dot) return;
+    dot.classList.remove("sw-tracking", "sw-status-saving", "sw-status-ok");
+    dot.classList.add("sw-status-error");
+    dot.title = "ShadowWrite: 扩展已更新，点击刷新页面";
   });
 
   // Tracking state toggle — update dot appearance
