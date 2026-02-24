@@ -36,6 +36,25 @@ from pathlib import Path
 from typing import Any, Dict, List
 from urllib.parse import urlparse
 
+# Pre-import tkinter so the browse-directory dialog opens faster.
+# If tkinter is unavailable (rare), we simply skip — the browse
+# endpoint will return an error at call time.
+try:
+    import tkinter as tk
+    from tkinter import filedialog as _tk_filedialog
+
+    # Windows high-DPI fix — makes the dialog render at native resolution
+    # instead of being blurry due to DPI virtualisation.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)   # PROCESS_SYSTEM_DPI_AWARE
+        except Exception:
+            pass  # older Windows or no shcore
+except ImportError:
+    tk = None  # type: ignore
+    _tk_filedialog = None  # type: ignore
+
 
 # ---------------------------------------------------------------------------
 # .env loader (same as shadowwrite_cli.py)
@@ -363,6 +382,13 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"conversations": convs})
             return
 
+        if path == "/api/config":
+            self._send_json(200, {
+                "outputDir": str(self.output_dir),
+                "chatHtml": self.chat_html,
+            })
+            return
+
         self._send_json(404, {"error": "Not found"})
 
     # ── POST endpoints ────────────────────────────────────────────
@@ -373,7 +399,129 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
             self._handle_messages()
             return
 
+        if path == "/api/config":
+            self._handle_config_update()
+            return
+
+        if path == "/api/browse-directory":
+            self._handle_browse_directory()
+            return
+
         self._send_json(404, {"error": "Not found"})
+
+    def _handle_browse_directory(self):
+        """Open a native directory-picker dialog and return the selected path."""
+        if tk is None:
+            self._send_json(500, {"error": "tkinter not available in this Python installation"})
+            return
+
+        # Read optional initialdir from request body
+        initial_dir = str(self.output_dir)
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length > 0:
+            try:
+                raw = self.rfile.read(content_length)
+                payload = json.loads(raw.decode("utf-8"))
+                if "initialDir" in payload:
+                    candidate = Path(payload["initialDir"]).resolve()
+                    if candidate.is_dir():
+                        initial_dir = str(candidate)
+            except Exception:
+                pass  # fall back to output_dir
+
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            folder = _tk_filedialog.askdirectory(
+                title="ShadowWrite — 选择输出目录",
+                initialdir=initial_dir,
+            )
+            root.destroy()
+
+            if folder:
+                self._send_json(200, {"selected": folder})
+            else:
+                self._send_json(200, {"selected": None, "cancelled": True})
+        except Exception as e:
+            self._send_json(500, {"error": f"Failed to open dialog: {e}"})
+
+    def _rename_conversation_files(
+        self,
+        md_path: Path,
+        html_path: Path,
+        new_display: str,
+        platform: str,
+    ) -> tuple[Path | None, Path | None]:
+        """Rename conversation files + directory when title changes.
+
+        Returns (new_md_path, new_html_path) on success, (None, None) on failure.
+        """
+        try:
+            old_dir = md_path.parent
+            dir_name = sanitize_filename(platform)
+            new_dir = self.output_dir / dir_name / sanitize_filename(new_display)
+
+            if new_dir.exists() and new_dir != old_dir:
+                self.log_message("  [rename] Target dir already exists, skipping: %s", new_dir)
+                return (None, None)
+
+            new_md   = new_dir / f"{new_display}.md"
+            new_html = new_dir / f"{new_display}.chat.html"
+
+            if old_dir == new_dir:
+                if md_path.exists():
+                    md_path.rename(new_md)
+                if html_path.exists():
+                    html_path.rename(new_html)
+            else:
+                new_dir.parent.mkdir(parents=True, exist_ok=True)
+                old_dir.rename(new_dir)
+                old_md_in_new   = new_dir / md_path.name
+                old_html_in_new = new_dir / html_path.name
+                if old_md_in_new.exists() and old_md_in_new != new_md:
+                    old_md_in_new.rename(new_md)
+                if old_html_in_new.exists() and old_html_in_new != new_html:
+                    old_html_in_new.rename(new_html)
+
+            self.log_message("  [rename] %s -> %s", old_dir.name, new_dir.name)
+            return (new_md, new_html)
+        except Exception as e:
+            self.log_message("  [rename] Failed: %s", e)
+            return (None, None)
+
+    def _handle_config_update(self):
+        """Update server configuration at runtime."""
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length == 0:
+            self._send_json(400, {"error": "Empty body"})
+            return
+        try:
+            raw = self.rfile.read(content_length)
+            payload = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            self._send_json(400, {"error": f"Invalid JSON: {e}"})
+            return
+
+        changed = []
+
+        if "outputDir" in payload:
+            new_dir = Path(payload["outputDir"]).resolve()
+            new_dir.mkdir(parents=True, exist_ok=True)
+            type(self).output_dir = new_dir
+            changed.append("outputDir")
+
+        if "chatHtml" in payload:
+            type(self).chat_html = bool(payload["chatHtml"])
+            changed.append("chatHtml")
+
+        self.log_message("  [config] updated: %s", ", ".join(changed) or "(none)")
+        self._send_json(200, {
+            "status": "ok",
+            "changed": changed,
+            "outputDir": str(self.output_dir),
+            "chatHtml": self.chat_html,
+        })
 
     def _handle_messages(self):
         # Parse request body
@@ -435,9 +583,28 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
         else:
             md_path = Path(meta["md_path"])
             html_path = Path(meta["html_path"])
-            # Update title if it changed
-            if title and title != meta.get("title"):
+
+            # Rename files / directory when title changes
+            if title and title.strip() and title != meta.get("title"):
+                old_title = meta.get("title", "")
                 meta["title"] = title
+                # Only rename if the old name was a placeholder (no title)
+                # or the user explicitly renamed the conversation.
+                new_display = sanitize_filename(title.strip())
+                old_display = sanitize_filename(old_title.strip()) if old_title and old_title.strip() else None
+                current_display = md_path.stem  # e.g. "gemini_gemini_9b34d180e1ab4e1e"
+
+                # Rename when: current file stem differs from desired name
+                if new_display and new_display != current_display:
+                    new_md, new_html = self._rename_conversation_files(
+                        md_path, html_path, new_display, platform,
+                    )
+                    if new_md:
+                        md_path = new_md
+                        html_path = new_html
+                        meta["md_path"] = str(md_path)
+                        meta["html_path"] = str(html_path)
+
                 self.state.set_meta(conversation_id, meta)
 
             # If output files were deleted externally, reset state so

@@ -5,147 +5,213 @@
   <title>ShadowWrite</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
+
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      width: 300px;
-      padding: 16px;
-      background: #1a1a2e;
-      color: #e0e0e0;
+      width: 280px;
+      background: #16161e;
+      color: #c0c0c8;
+      font-size: 12px;
     }
 
-    /* Header */
-    .header {
+    /* ── Header ──────────────────────────────── */
+    .hdr {
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      margin-bottom: 16px;
-      padding-bottom: 12px;
-      border-bottom: 1px solid #333;
+      gap: 10px;
+      padding: 14px 16px 10px;
     }
-    .header h1 {
-      font-size: 16px;
+    .hdr img { width: 28px; height: 28px; border-radius: 6px; }
+    .hdr .t { font-size: 14px; font-weight: 600; color: #e0e0e8; }
+    .hdr .v { font-size: 9px; color: #555; margin-left: 4px; }
+
+    /* ── Status ──────────────────────────────── */
+    .st {
+      margin: 0 16px 10px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      background: #1c1c26;
+      text-align: center;
+      font-size: 10.5px;
+      color: #555;
+      min-height: 16px;
+      transition: all 0.2s;
+    }
+    .st.ok  { color: #4ade80; background: rgba(74,222,128,0.08); }
+    .st.err { color: #f87171; background: rgba(248,113,113,0.08); }
+
+    /* ── Divider ─────────────────────────────── */
+    .d { height: 1px; background: linear-gradient(90deg, transparent, #2a2a36, transparent); margin: 0 16px; }
+
+    /* ── Section ─────────────────────────────── */
+    .sec { padding: 10px 16px 6px; }
+    .sec-l {
+      font-size: 9px;
       font-weight: 600;
-      color: #89b4fa;
-    }
-    .header .version {
-      font-size: 11px;
-      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: #4a4a54;
+      margin-bottom: 8px;
     }
 
-    /* Toggle switch */
-    .toggle-row {
+    /* ── Toggle ──────────────────────────────── */
+    .tg {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      margin-bottom: 14px;
+      padding: 5px 0;
     }
-    .toggle-row label {
-      font-size: 13px;
-    }
-    .switch {
+    .tg span { font-size: 11.5px; color: #a0a0a8; }
+    .sw {
       position: relative;
-      width: 40px;
-      height: 22px;
+      width: 32px; height: 18px;
+      flex-shrink: 0;
     }
-    .switch input { opacity: 0; width: 0; height: 0; }
-    .slider {
-      position: absolute;
-      cursor: pointer;
-      inset: 0;
-      background: #444;
-      border-radius: 22px;
-      transition: 0.2s;
+    .sw input { opacity: 0; width: 0; height: 0; position: absolute; }
+    .sl {
+      position: absolute; inset: 0;
+      background: #333; border-radius: 18px;
+      cursor: pointer; transition: 0.2s;
     }
-    .slider::before {
+    .sl::before {
       content: "";
       position: absolute;
-      width: 16px;
-      height: 16px;
-      left: 3px;
-      bottom: 3px;
-      background: #fff;
-      border-radius: 50%;
+      width: 12px; height: 12px;
+      left: 3px; bottom: 3px;
+      background: #777; border-radius: 50%;
       transition: 0.2s;
     }
-    .switch input:checked + .slider { background: #22c55e; }
-    .switch input:checked + .slider::before { transform: translateX(18px); }
+    .sw input:checked + .sl { background: #e8a048; }
+    .sw input:checked + .sl::before { transform: translateX(14px); background: #fff; }
 
-    /* Form fields */
-    .field {
-      margin-bottom: 12px;
-    }
-    .field label {
+    /* ── Input field ─────────────────────────── */
+    .f { margin-bottom: 8px; }
+    .f label {
       display: block;
-      font-size: 12px;
-      color: #aaa;
-      margin-bottom: 4px;
+      font-size: 9.5px;
+      color: #555;
+      margin-bottom: 3px;
     }
-    .field input {
+    .f input {
       width: 100%;
-      padding: 6px 8px;
-      background: #2a2a3e;
-      border: 1px solid #444;
-      border-radius: 4px;
-      color: #e0e0e0;
-      font-size: 13px;
+      padding: 5px 8px;
+      background: #1c1c26;
+      border: 1px solid #2a2a36;
+      border-radius: 6px;
+      color: #c0c0c8;
+      font-size: 11.5px;
+      font-family: inherit;
       outline: none;
+      transition: border-color 0.2s;
     }
-    .field input:focus {
-      border-color: #89b4fa;
-    }
-    .row {
-      display: flex;
-      gap: 8px;
-    }
-    .row .field { flex: 1; }
-    .row .field.port { max-width: 80px; }
+    .f input:focus { border-color: #e8a048; }
+    .f input::placeholder { color: #3a3a44; }
 
-    /* Status */
-    .status {
-      font-size: 11px;
-      color: #888;
-      text-align: center;
-      margin-top: 8px;
-      min-height: 16px;
+    /* Inline row */
+    .r { display: flex; gap: 6px; }
+    .r .f { flex: 1; }
+    .r .f.pt { max-width: 64px; }
+
+    /* ── Browse button ────────────────────────── */
+    .dir-row {
+      display: flex;
+      gap: 4px;
+      align-items: stretch;
     }
-    .status.ok { color: #22c55e; }
-    .status.err { color: #ef4444; }
+    .dir-row .f { flex: 1; margin-bottom: 0; }
+    .dir-btn {
+      flex-shrink: 0;
+      width: 28px;
+      background: #1c1c26;
+      border: 1px solid #2a2a36;
+      border-radius: 6px;
+      color: #777;
+      font-size: 12px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: border-color 0.2s, color 0.2s;
+      margin-top: 14px; /* align with input (accounting for label) */
+    }
+    .dir-btn:hover { border-color: #e8a048; color: #e8a048; }
+
+
+
+    /* ── Footer ──────────────────────────────── */
+    .ft {
+      padding: 6px 16px 10px;
+      text-align: center;
+      font-size: 9px;
+      color: #2a2a34;
+    }
   </style>
 </head>
 <body>
-  <div class="header">
-    <h1>ShadowWrite</h1>
-    <span class="version">v0.1.0</span>
-  </div>
 
-  <div class="toggle-row">
-    <label>启用实时捕获</label>
-    <label class="switch">
-      <input type="checkbox" id="enabled" checked>
-      <span class="slider"></span>
-    </label>
-  </div>
-
-  <div class="toggle-row">
-    <label>自动捕获新对话</label>
-    <label class="switch">
-      <input type="checkbox" id="autoCapture" checked>
-      <span class="slider"></span>
-    </label>
-  </div>
-
-  <div class="row">
-    <div class="field">
-      <label>Host</label>
-      <input type="text" id="host" value="127.0.0.1" placeholder="127.0.0.1">
-    </div>
-    <div class="field port">
-      <label>Port</label>
-      <input type="number" id="port" value="24601" placeholder="24601">
+  <!-- Header -->
+  <div class="hdr">
+    <img src="../icons/icon48.png" alt="ShadowWrite">
+    <div>
+      <span class="t">ShadowWrite</span>
+      <span class="v">v0.1.0</span>
     </div>
   </div>
 
-  <div class="status" id="status"></div>
+  <!-- Status -->
+  <div class="st" id="status">…</div>
+
+  <!-- Capture -->
+  <div class="sec">
+    <div class="sec-l">捕获</div>
+    <div class="tg">
+      <span>当前对话追踪</span>
+      <label class="sw"><input type="checkbox" id="trackingToggle"><span class="sl"></span></label>
+    </div>
+    <div class="tg">
+      <span>自动追踪新对话</span>
+      <label class="sw"><input type="checkbox" id="autoCapture" checked><span class="sl"></span></label>
+    </div>
+  </div>
+
+  <div class="d"></div>
+
+  <!-- Server -->
+  <div class="sec">
+    <div class="sec-l">本地服务</div>
+    <div class="r">
+      <div class="f">
+        <label>Host</label>
+        <input type="text" id="host" value="127.0.0.1" placeholder="127.0.0.1">
+      </div>
+      <div class="f pt">
+        <label>Port</label>
+        <input type="number" id="port" value="24601" placeholder="24601">
+      </div>
+    </div>
+  </div>
+
+  <div class="d"></div>
+
+  <!-- Output (loaded from server) -->
+  <div class="sec">
+    <div class="sec-l">输出</div>
+    <div class="f">
+      <label>输出目录</label>
+      <div class="dir-row">
+        <div class="f">
+          <input type="text" id="outputDir" value="" placeholder="(从服务器加载)">
+        </div>
+        <button class="dir-btn" id="browseDir" title="浏览…">📂</button>
+      </div>
+    </div>
+    <div class="tg">
+      <span>生成 Chat HTML</span>
+      <label class="sw"><input type="checkbox" id="chatHtml"><span class="sl"></span></label>
+    </div>
+  </div>
+
+  <div class="ft">silent sync · local markdown</div>
 
   <script src="popup.js"></script>
 </body>

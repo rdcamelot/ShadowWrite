@@ -59,14 +59,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }, 8000);
       break;
 
-    // Popup toggles enabled state
+    // Popup settings — popup writes directly to chrome.storage.sync;
+    // the onChanged listener below broadcasts to content scripts.
     case "setEnabled":
-      chrome.storage.sync.set({ enabled: message.enabled });
-      break;
-
-    // Popup updates settings
     case "updateSettings":
-      chrome.storage.sync.set(message.settings);
+    case "settingsUpdated":
       break;
 
     // Content script asks background to relay HTTP to local server
@@ -91,6 +88,61 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
       })();
       return true; // keep message channel open for async sendResponse
+
+    // Popup asks background to GET server config
+    case "getServerConfig":
+      (async () => {
+        try {
+          const s = await chrome.storage.sync.get(DEFAULT_SETTINGS);
+          const url = `http://${s.host}:${s.port}/api/config`;
+          const resp = await fetch(url, { signal: AbortSignal.timeout(3000) });
+          const data = await resp.json();
+          sendResponse({ success: true, data });
+        } catch (err) {
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
+
+    // Popup asks background to POST updated config to server
+    case "setServerConfig":
+      (async () => {
+        try {
+          const s = await chrome.storage.sync.get(DEFAULT_SETTINGS);
+          const url = `http://${s.host}:${s.port}/api/config`;
+          const resp = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(message.config),
+          });
+          const data = await resp.json();
+          sendResponse({ success: resp.ok, data });
+        } catch (err) {
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
+
+    // Popup asks server to open a native directory picker dialog
+    case "browseDirectory":
+      (async () => {
+        try {
+          const s = await chrome.storage.sync.get(DEFAULT_SETTINGS);
+          const url = `http://${s.host}:${s.port}/api/browse-directory`;
+          const body = message.initialDir ? JSON.stringify({ initialDir: message.initialDir }) : "{}";
+          const resp = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body,
+            signal: AbortSignal.timeout(120000), // user may take time to pick
+          });
+          const data = await resp.json();
+          sendResponse({ success: resp.ok, data });
+        } catch (err) {
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
 
     default:
       console.warn("[ShadowWrite] Unknown message type:", message.type);

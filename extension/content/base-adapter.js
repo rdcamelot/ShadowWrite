@@ -208,7 +208,20 @@
     async _loadTrackingState() {
       try {
         const data = await chrome.storage.local.get({ trackedConversations: {} });
-        this.isTracking = !!data.trackedConversations[this.currentConversationId];
+        const entry = data.trackedConversations[this.currentConversationId];
+
+        if (entry && !entry.disabled) {
+          // Previously tracked — resume
+          this.isTracking = true;
+        } else if (!entry && this.settings.autoCapture) {
+          // Never seen before + autoCapture ON → auto-enable
+          console.log(`[ShadowWrite] autoCapture: auto-enabling tracking for ${this.currentConversationId}`);
+          this.enableTracking();
+          return; // enableTracking handles notification + observer
+        } else {
+          // Explicitly disabled or autoCapture OFF
+          this.isTracking = false;
+        }
       } catch {
         this.isTracking = false;
       }
@@ -269,7 +282,8 @@
       if (!this.currentConversationId || this._contextInvalidated) return;
       try {
         const data = await chrome.storage.local.get({ trackedConversations: {} });
-        delete data.trackedConversations[this.currentConversationId];
+        // Store disabled marker so autoCapture won't re-enable this conversation
+        data.trackedConversations[this.currentConversationId] = { disabled: true };
         await chrome.storage.local.set(data);
       } catch (err) {
         if (this._handleContextInvalidated(err)) return;
@@ -454,10 +468,34 @@
 
     _setupEventListeners() {
       // Settings update from popup / background
-      chrome.runtime.onMessage.addListener((message) => {
-        if (message.type === "settingsUpdated" && message.settings) {
-          Object.assign(this.settings, message.settings);
-          console.log("[ShadowWrite] Settings updated:", this.settings);
+      chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+        switch (message.type) {
+          case "settingsUpdated":
+          case "settingsChanged":
+            if (message.settings) {
+              Object.assign(this.settings, message.settings);
+              console.log("[ShadowWrite] Settings updated:", this.settings);
+            }
+            break;
+
+          // Popup queries tracking state for the "当前对话追踪" toggle
+          case "getTrackingState":
+            sendResponse({
+              isTracking: this.isTracking,
+              hasConversation: !!this.currentConversationId,
+              conversationId: this.currentConversationId,
+            });
+            break;
+
+          // Popup sets tracking on/off (same as clicking the dot)
+          case "setTracking":
+            if (message.enabled) {
+              this.enableTracking();
+            } else {
+              this.disableTracking();
+            }
+            sendResponse({ ok: true });
+            break;
         }
       });
     }
