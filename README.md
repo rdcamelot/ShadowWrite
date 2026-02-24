@@ -69,7 +69,7 @@ python shadowwrite_server.py
 
 打开 ChatGPT / Claude / Gemini / DeepSeek / Kimi / 豆包 / 元宝，进入对话。
 
-页面右下角出现一个小圆点——**点击它开启追踪**：
+页面右下角出现一个小圆点——**点击它开启/关闭追踪**，也可以通过右上角扩展图标的弹窗来控制：
 
 | 状态 | 外观 | 操作 |
 |------|------|------|
@@ -79,15 +79,18 @@ python shadowwrite_server.py
 | 同步成功 | 绿色 | 自动恢复 |
 | 连接失败 | 红色 | 检查服务是否运行 |
 
-> 默认不追踪任何对话。只有手动点击开启的对话才会同步到本地。状态持久化，刷新页面保持。
+> **自动追踪**：弹窗中"自动追踪新对话"默认开启，对新开一个对话会自动开启追踪。进入一个历史对话，默认不追踪。切换到扩展已经记录过状态的对话时，以该对话上次保存的状态为准，不会强制重新开启。手动关闭过的对话会记住"已关闭"状态，不会被自动重新追踪。弹窗中的"当前对话追踪"开关与页面右下角的圆点完全同步。
+
+> 网页端对话重命名后，服务器会在下一次同步时自动将本地文件及目录一并重命名。
 
 **第四步：查看输出**
 
 ```
 outputs/
-└── gemini_炼金术与魔法学院/
-    ├── 炼金术与魔法学院.md           ← Markdown（可直接编辑）
-    └── 炼金术与魔法学院.chat.html    ← 聊天视图（浏览器打开）
+└── gemini/
+    └── 炼金术与魔法学院/
+        ├── 炼金术与魔法学院.md           ← Markdown（可直接编辑）
+        └── 炼金术与魔法学院.chat.html    ← 聊天视图（浏览器打开）
 ```
 
 > 冒烟测试（不需要浏览器）：
@@ -210,10 +213,13 @@ python shadowwrite_cli.py --no-record --context-file auto
 
 - Manifest V3，7 平台 content scripts
 - `BaseShadowWriteAdapter` 基类 + 平台子类
-- `MutationObserver` + 1s debounce 实时监听
-- JSON 快照差异比较，仅发送增量
+- `MutationObserver` + 1s debounce / 3s throttle 实时监听（串流期间最多 3s 延迟）
+- JSON 快照差异比较 + 流式 upsert（内容变化时截断文件重写，不产生重复）
 - HTTP 通过 background service worker 中继（绕过 CSP）
 - 按对话粒度追踪开关，状态持久化到 `chrome.storage.local`
+- 自动追踪新对话（autoCapture），手动关闭的对话记住"已禁用"状态
+- Epoch 计数器防止跨对话的过期定时器触发
+- Popup 弹窗：与运行中服务器双向同步配置（输出目录、Chat HTML 开关）；支持通过服务器弹出原生目录选择对话框
 
 **支持平台：**
 
@@ -230,10 +236,15 @@ python shadowwrite_cli.py --no-record --context-file auto
 ### 本地 HTTP 服务 (`shadowwrite_server.py`)
 
 - 纯 stdlib，端口 `24601`
-- `POST /api/messages` — 接收增量消息，写入 `.md` + `.chat.html`
-- `GET /api/health` — 连接测试
-- `GET /api/conversations` — 活跃会话列表
+- `POST /api/messages` — 接收增量消息，写入 `.md` + `.chat.html`；流式 upsert：同一消息内容变化时截断重写
+- `GET  /api/health` — 连接测试
+- `GET  /api/conversations` — 活跃会话列表
+- `GET  /api/config` — 读取运行时配置（输出目录、Chat HTML 开关）
+- `POST /api/config` — 热更新服务器配置，立即生效
+- `POST /api/browse-directory` — 在服务器端弹出原生目录选择对话框，返回所选路径
 - 线程安全，`messageId` 幂等去重，CORS 支持
+- 对话标题变更时自动重命名本地文件及目录
+- 输出结构：`{output_dir}/{platform}/{标题}/`
 
 ---
 
@@ -253,6 +264,7 @@ SHADOWWRITE_CONTEXT_FILE=auto
 SHADOWWRITE_SERVER_HOST=127.0.0.1
 SHADOWWRITE_SERVER_PORT=24601
 SHADOWWRITE_OUTPUT_DIR=./outputs
+SHADOWWRITE_SERVER_CHAT_HTML=true   # false 则不生成 .chat.html
 ```
 
 ---
@@ -300,9 +312,11 @@ ShadowWrite/
 
 **Chrome 扩展：**
 
+- [x] 自动追踪新对话（autoCapture）
+- [x] Popup 与服务器配置双向同步
+- [x] 对话重命名时自动同步本地文件
 - [ ] 自动启停本地服务（Chrome Native Messaging + 系统注册）
 - [ ] 首次追踪时自动滚动加载完整对话历史
-- [ ] 多轮去重优化（基于内容 hash）
 - [ ] CSS 选择器热更新机制
 
 ---
