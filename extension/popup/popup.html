@@ -136,6 +136,13 @@
     }
     .dir-btn:hover { border-color: #e8a048; color: #e8a048; }
 
+    .hint {
+      font-size: 9px;
+      color: #555;
+      margin-top: 3px;
+      padding-left: 2px;
+    }
+
 
 
     /* ── Footer ──────────────────────────────── */
@@ -197,13 +204,15 @@
   <div class="sec">
     <div class="sec-l">输出</div>
     <div class="f">
-      <label>输出目录</label>
+      <label id="outputDirLabel">输出目录</label>
       <div class="dir-row">
         <div class="f">
           <input type="text" id="outputDir" value="" placeholder="(从服务器加载)">
         </div>
         <button class="dir-btn" id="browseDir" title="浏览…">📂</button>
+        <button class="dir-btn" id="resetDir" title="恢复全局默认" style="display:none">↩</button>
       </div>
+      <div class="hint" id="outputDirHint" style="display:none"></div>
     </div>
     <div class="tg">
       <span>生成 Chat HTML</span>

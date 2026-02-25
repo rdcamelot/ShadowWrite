@@ -94,7 +94,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       (async () => {
         try {
           const s = await chrome.storage.sync.get(DEFAULT_SETTINGS);
-          const url = `http://${s.host}:${s.port}/api/config`;
+          let url = `http://${s.host}:${s.port}/api/config`;
+          if (message.conversationId) {
+            url += `?conversationId=${encodeURIComponent(message.conversationId)}`;
+          }
           const resp = await fetch(url, { signal: AbortSignal.timeout(3000) });
           const data = await resp.json();
           sendResponse({ success: true, data });

@@ -515,6 +515,15 @@
         messages,
       };
 
+      // Include per-conversation output directory if set
+      try {
+        const data = await chrome.storage.local.get({ convOutputDirs: {} });
+        const customDir = data.convOutputDirs[this.currentConversationId];
+        if (customDir) {
+          payload.outputDir = customDir;
+        }
+      } catch { /* ignore */ }
+
       try {
         // Relay through background service worker to bypass page CSP.
         const resp = await chrome.runtime.sendMessage({

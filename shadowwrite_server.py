@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import sys
 import threading
@@ -34,7 +35,7 @@ from html import escape as html_escape
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Dict, List
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 # Pre-import tkinter so the browse-directory dialog opens faster.
 # If tkinter is unavailable (rare), we simply skip — the browse
@@ -383,10 +384,21 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/config":
-            self._send_json(200, {
+            query = parse_qs(urlparse(self.path).query)
+            conv_id = query.get("conversationId", [None])[0]
+            response = {
                 "outputDir": str(self.output_dir),
+                "globalDir": str(self.output_dir),
                 "chatHtml": self.chat_html,
-            })
+                "isCustom": False,
+            }
+            if conv_id:
+                meta = self.state.get_meta(conv_id)
+                if meta:
+                    conv_base = meta.get("base_dir", str(self.output_dir))
+                    response["outputDir"] = conv_base
+                    response["isCustom"] = conv_base != str(self.output_dir)
+            self._send_json(200, response)
             return
 
         self._send_json(404, {"error": "Not found"})
@@ -452,6 +464,7 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
         html_path: Path,
         new_display: str,
         platform: str,
+        base_dir: Path | None = None,
     ) -> tuple[Path | None, Path | None]:
         """Rename conversation files + directory when title changes.
 
@@ -460,7 +473,7 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
         try:
             old_dir = md_path.parent
             dir_name = sanitize_filename(platform)
-            new_dir = self.output_dir / dir_name / sanitize_filename(new_display)
+            new_dir = (base_dir or self.output_dir) / dir_name / sanitize_filename(new_display)
 
             if new_dir.exists() and new_dir != old_dir:
                 self.log_message("  [rename] Target dir already exists, skipping: %s", new_dir)
@@ -490,6 +503,42 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
             self.log_message("  [rename] Failed: %s", e)
             return (None, None)
 
+    def _move_conversation_files(
+        self,
+        md_path: Path,
+        html_path: Path,
+        new_base_dir: Path,
+        platform: str,
+    ) -> tuple[Path | None, Path | None]:
+        """Move conversation files to a different base output directory.
+
+        Returns (new_md_path, new_html_path) on success, (None, None) on failure.
+        """
+        try:
+            old_dir = md_path.parent
+            dir_name = sanitize_filename(platform)
+            display_name = md_path.stem
+            new_dir = new_base_dir / dir_name / sanitize_filename(display_name)
+
+            if new_dir == old_dir:
+                return (md_path, html_path)
+
+            if new_dir.exists():
+                self.log_message("  [move] Target dir already exists, skipping: %s", new_dir)
+                return (None, None)
+
+            new_dir.parent.mkdir(parents=True, exist_ok=True)
+            new_md = new_dir / md_path.name
+            new_html = new_dir / html_path.name
+
+            shutil.move(str(old_dir), str(new_dir))
+
+            self.log_message("  [move] %s \u2192 %s", old_dir, new_dir)
+            return (new_md, new_html)
+        except Exception as e:
+            self.log_message("  [move] Failed: %s", e)
+            return (None, None)
+
     def _handle_config_update(self):
         """Update server configuration at runtime."""
         content_length = int(self.headers.get("Content-Length", 0))
@@ -503,6 +552,12 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": f"Invalid JSON: {e}"})
             return
 
+        conversation_id = payload.get("conversationId")
+        if conversation_id:
+            self._handle_conversation_config(conversation_id, payload)
+            return
+
+        # Global config update
         changed = []
 
         if "outputDir" in payload:
@@ -520,6 +575,60 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
             "status": "ok",
             "changed": changed,
             "outputDir": str(self.output_dir),
+            "globalDir": str(self.output_dir),
+            "chatHtml": self.chat_html,
+        })
+
+    def _handle_conversation_config(self, conversation_id: str, payload: dict):
+        """Update per-conversation configuration (output directory)."""
+        meta = self.state.get_meta(conversation_id)
+
+        if "outputDir" not in payload:
+            effective_dir = meta.get("base_dir", str(self.output_dir)) if meta else str(self.output_dir)
+        elif payload["outputDir"]:
+            # Set custom directory
+            new_base = Path(payload["outputDir"]).resolve()
+            new_base.mkdir(parents=True, exist_ok=True)
+            effective_dir = str(new_base)
+            if meta:
+                old_base = meta.get("base_dir", str(self.output_dir))
+                if str(new_base) != old_base:
+                    md_path = Path(meta["md_path"])
+                    html_path = Path(meta["html_path"])
+                    if md_path.exists():
+                        new_md, new_html = self._move_conversation_files(
+                            md_path, html_path, new_base, meta["platform"],
+                        )
+                        if new_md:
+                            meta["md_path"] = str(new_md)
+                            meta["html_path"] = str(new_html)
+                    meta["base_dir"] = str(new_base)
+                    self.state.set_meta(conversation_id, meta)
+        else:
+            # Reset to global (outputDir is null/empty)
+            effective_dir = str(self.output_dir)
+            if meta:
+                old_base = meta.get("base_dir", str(self.output_dir))
+                if old_base != str(self.output_dir):
+                    md_path = Path(meta["md_path"])
+                    html_path = Path(meta["html_path"])
+                    if md_path.exists():
+                        new_md, new_html = self._move_conversation_files(
+                            md_path, html_path, self.output_dir, meta["platform"],
+                        )
+                        if new_md:
+                            meta["md_path"] = str(new_md)
+                            meta["html_path"] = str(new_html)
+                    meta["base_dir"] = str(self.output_dir)
+                    self.state.set_meta(conversation_id, meta)
+
+        self.log_message("  [config] conv %s \u2192 outputDir: %s", conversation_id[:16], effective_dir)
+        self._send_json(200, {
+            "status": "ok",
+            "conversationId": conversation_id,
+            "outputDir": effective_dir,
+            "globalDir": str(self.output_dir),
+            "isCustom": effective_dir != str(self.output_dir),
             "chatHtml": self.chat_html,
         })
 
@@ -543,6 +652,7 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
         messages = payload.get("messages", [])
         title = payload.get("title", "")
         url = payload.get("url", "")
+        custom_output_dir = payload.get("outputDir")  # per-conversation override
 
         if not platform or not conversation_id:
             self._send_json(400, {
@@ -554,6 +664,13 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "messages must be a non-empty array"})
             return
 
+        # Determine base output directory (per-conversation override or global)
+        if custom_output_dir:
+            base_dir = Path(custom_output_dir).resolve()
+            base_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            base_dir = self.output_dir
+
         # Resolve output paths
         meta = self.state.get_meta(conversation_id)
         if meta is None:
@@ -562,11 +679,11 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
                 display_name = sanitize_filename(title.strip())
             else:
                 display_name = sanitize_filename(f"{platform}_{conversation_id}")
-            # Directory: {output_dir}/{platform}/{display_name}/
+            # Directory: {base_dir}/{platform}/{display_name}/
             dir_name = sanitize_filename(platform)
             sub_name = sanitize_filename(display_name)
-            md_path = self.output_dir / dir_name / sub_name / f"{display_name}.md"
-            html_path = self.output_dir / dir_name / sub_name / f"{display_name}.chat.html"
+            md_path = base_dir / dir_name / sub_name / f"{display_name}.md"
+            html_path = base_dir / dir_name / sub_name / f"{display_name}.chat.html"
 
             ensure_output_file(md_path, platform, title)
             if self.chat_html:
@@ -578,26 +695,38 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
                 "url": url,
                 "md_path": str(md_path),
                 "html_path": str(html_path),
+                "base_dir": str(base_dir),
             }
             self.state.set_meta(conversation_id, meta)
         else:
             md_path = Path(meta["md_path"])
             html_path = Path(meta["html_path"])
 
+            # Move files if per-conversation output directory changed
+            old_base = meta.get("base_dir", str(self.output_dir))
+            if str(base_dir) != old_base:
+                if md_path.exists():
+                    new_md, new_html = self._move_conversation_files(
+                        md_path, html_path, base_dir, platform,
+                    )
+                    if new_md:
+                        md_path = new_md
+                        html_path = new_html
+                        meta["md_path"] = str(md_path)
+                        meta["html_path"] = str(html_path)
+                meta["base_dir"] = str(base_dir)
+
             # Rename files / directory when title changes
             if title and title.strip() and title != meta.get("title"):
                 old_title = meta.get("title", "")
                 meta["title"] = title
-                # Only rename if the old name was a placeholder (no title)
-                # or the user explicitly renamed the conversation.
                 new_display = sanitize_filename(title.strip())
                 old_display = sanitize_filename(old_title.strip()) if old_title and old_title.strip() else None
-                current_display = md_path.stem  # e.g. "gemini_gemini_9b34d180e1ab4e1e"
+                current_display = md_path.stem
 
-                # Rename when: current file stem differs from desired name
                 if new_display and new_display != current_display:
                     new_md, new_html = self._rename_conversation_files(
-                        md_path, html_path, new_display, platform,
+                        md_path, html_path, new_display, platform, base_dir,
                     )
                     if new_md:
                         md_path = new_md

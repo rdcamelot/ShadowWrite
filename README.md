@@ -83,6 +83,8 @@ python shadowwrite_server.py
 
 > 网页端对话重命名后，服务器会在下一次同步时自动将本地文件及目录一并重命名。
 
+> **按对话指定输出目录**：在 AI 会话页面打开弹窗，"输出目录"一栏变为"**输出目录 (当前对话)**"，可单独为这个对话指定保存路径（例如直接保存到相关项目目录中）。修改后底部会显示全局默认路径，点击 ↩ 按钮可随时重置回全局。修改目录时，服务器会自动将该对话已有的文件整体迁移到新路径。
+
 **第四步：查看输出**
 
 ```
@@ -219,7 +221,7 @@ python shadowwrite_cli.py --no-record --context-file auto
 - 按对话粒度追踪开关，状态持久化到 `chrome.storage.local`
 - 自动追踪新对话（autoCapture），手动关闭的对话记住"已禁用"状态
 - Epoch 计数器防止跨对话的过期定时器触发
-- Popup 弹窗：与运行中服务器双向同步配置（输出目录、Chat HTML 开关）；支持通过服务器弹出原生目录选择对话框
+- Popup 弹窗：与运行中服务器双向同步配置（输出目录、Chat HTML 开关）；支持通过服务器弹出原生目录选择对话框；可为每个对话单独设置输出目录，修改时自动迁移已有文件
 
 **支持平台：**
 
@@ -239,8 +241,8 @@ python shadowwrite_cli.py --no-record --context-file auto
 - `POST /api/messages` — 接收增量消息，写入 `.md` + `.chat.html`；流式 upsert：同一消息内容变化时截断重写
 - `GET  /api/health` — 连接测试
 - `GET  /api/conversations` — 活跃会话列表
-- `GET  /api/config` — 读取运行时配置（输出目录、Chat HTML 开关）
-- `POST /api/config` — 热更新服务器配置，立即生效
+- `GET  /api/config` — 读取运行时配置；附 `?conversationId=` 可获取该对话的实际输出目录及是否使用自定义路径
+- `POST /api/config` — 热更新配置：不传 `conversationId` 时修改全局目录/Chat HTML；传入 `conversationId` 时设置对话级自定义目录，服务器自动迁移已有文件（`outputDir: null` 重置回全局）
 - `POST /api/browse-directory` — 在服务器端弹出原生目录选择对话框，返回所选路径
 - 线程安全，`messageId` 幂等去重，CORS 支持
 - 对话标题变更时自动重命名本地文件及目录
@@ -315,6 +317,7 @@ ShadowWrite/
 - [x] 自动追踪新对话（autoCapture）
 - [x] Popup 与服务器配置双向同步
 - [x] 对话重命名时自动同步本地文件
+- [x] 每个对话可单独指定输出目录（含自动文件迁移）
 - [ ] 自动启停本地服务（Chrome Native Messaging + 系统注册）
 - [ ] 首次追踪时自动滚动加载完整对话历史
 - [ ] CSS 选择器热更新机制

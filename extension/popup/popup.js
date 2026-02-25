@@ -3,16 +3,19 @@
  *
  * - "当前对话追踪" toggle: queries and controls the active tab's
  *   tracking state (synced with the floating dot indicator).
- * - "自动追踪新对话" toggle: stored in chrome.storage.sync, controls
- *   whether new conversations auto-start tracking.
+ * - "自动追踪新对话" toggle: stored in chrome.storage.sync.
  * - Host/Port: stored in chrome.storage.sync (extension-local).
- * - outputDir / chatHtml: loaded from & saved to the running server
- *   via background relay (GET/POST /api/config).
+ * - outputDir: per-conversation (chrome.storage.local + server),
+ *   falls back to server global default.
+ * - chatHtml: global server config.
  */
 
 "use strict";
 
 const $ = (id) => document.getElementById(id);
+
+let activeConversationId = null;
+let globalOutputDir = "";
 
 // ── Helpers ───────────────────────────────────────────────────────
 
@@ -25,6 +28,19 @@ function setStatus(text, type) {
 /** Send a message to background and return the response. */
 function bg(msg) {
   return new Promise((resolve) => chrome.runtime.sendMessage(msg, resolve));
+}
+
+function showDirHint(isCustom) {
+  const hint = $("outputDirHint");
+  const resetBtn = $("resetDir");
+  if (isCustom) {
+    hint.textContent = `全局默认: ${globalOutputDir}`;
+    hint.style.display = "";
+    resetBtn.style.display = "";
+  } else {
+    hint.style.display = "none";
+    resetBtn.style.display = "none";
+  }
 }
 
 // ── Load ──────────────────────────────────────────────────────────
@@ -40,8 +56,8 @@ async function loadSettings() {
   $("host").value = local.host;
   $("port").value = local.port;
 
-  // 2. Query active tab for tracking state (synced with dot)
-  loadTrackingState();
+  // 2. Query active tab for tracking state + conversationId
+  await loadTrackingState();
 
   // 3. Server config (outputDir, chatHtml)
   await loadServerConfig();
@@ -49,41 +65,75 @@ async function loadSettings() {
 
 /**
  * Query the active tab's content script for the current
- * tracking state and update the popup toggle accordingly.
+ * tracking state and extract conversationId.
  */
-async function loadTrackingState() {
+function loadTrackingState() {
   const toggle = $("trackingToggle");
-  try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.id) {
-      toggle.checked = false;
-      toggle.disabled = true;
-      return;
-    }
-    chrome.tabs.sendMessage(tab.id, { type: "getTrackingState" }, (resp) => {
-      if (chrome.runtime.lastError || !resp) {
-        // No content script on this page (not a supported AI platform)
+  return new Promise((resolve) => {
+    chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+      if (!tab?.id) {
         toggle.checked = false;
         toggle.disabled = true;
+        resolve();
         return;
       }
-      toggle.disabled = !resp.hasConversation;
-      toggle.checked = !!resp.isTracking;
+      chrome.tabs.sendMessage(tab.id, { type: "getTrackingState" }, (resp) => {
+        if (chrome.runtime.lastError || !resp) {
+          toggle.checked = false;
+          toggle.disabled = true;
+          resolve();
+          return;
+        }
+        toggle.disabled = !resp.hasConversation;
+        toggle.checked = !!resp.isTracking;
+        activeConversationId = resp.conversationId || null;
+        resolve();
+      });
+    }).catch(() => {
+      toggle.checked = false;
+      toggle.disabled = true;
+      resolve();
     });
-  } catch {
-    toggle.checked = false;
-    toggle.disabled = true;
-  }
+  });
 }
 
 async function loadServerConfig() {
   setStatus("正在连接…", "");
   try {
-    const res = await bg({ type: "getServerConfig" });
+    const msg = { type: "getServerConfig" };
+    if (activeConversationId) msg.conversationId = activeConversationId;
+
+    const res = await bg(msg);
     if (res && res.success) {
-      const cfg = res.data; // { outputDir, chatHtml }
-      $("outputDir").value = cfg.outputDir ?? "";
+      const cfg = res.data;
+      globalOutputDir = cfg.globalDir || cfg.outputDir || "";
       $("chatHtml").checked = !!cfg.chatHtml;
+
+      if (activeConversationId) {
+        $("outputDirLabel").textContent = "输出目录 (当前对话)";
+
+        // Check server-side custom dir first, then extension storage
+        let customDir = null;
+        if (cfg.isCustom) {
+          customDir = cfg.outputDir;
+        } else {
+          const data = await chrome.storage.local.get({ convOutputDirs: {} });
+          customDir = data.convOutputDirs[activeConversationId] || null;
+        }
+
+        if (customDir && customDir !== globalOutputDir) {
+          $("outputDir").value = customDir;
+          showDirHint(true);
+        } else {
+          $("outputDir").value = globalOutputDir;
+          showDirHint(false);
+        }
+      } else {
+        $("outputDirLabel").textContent = "输出目录 (全局)";
+        $("outputDir").value = cfg.outputDir ?? "";
+        showDirHint(false);
+      }
+
       setStatus("✓ 本地服务已连接", "ok");
     } else {
       setStatus("✗ 无法读取服务器配置", "err");
@@ -95,14 +145,72 @@ async function loadServerConfig() {
 
 // ── Save ──────────────────────────────────────────────────────────
 
+/** Push outputDir change — per-conversation or global depending on context. */
+async function pushDirConfig() {
+  const dir = $("outputDir").value.trim();
+
+  if (activeConversationId) {
+    // Per-conversation
+    const isCustom = !!(dir && dir !== globalOutputDir);
+
+    // Persist to extension storage
+    const data = await chrome.storage.local.get({ convOutputDirs: {} });
+    if (isCustom) {
+      data.convOutputDirs[activeConversationId] = dir;
+    } else {
+      delete data.convOutputDirs[activeConversationId];
+    }
+    await chrome.storage.local.set(data);
+
+    // Notify server (may trigger file move)
+    try {
+      const config = {
+        conversationId: activeConversationId,
+        outputDir: isCustom ? dir : null,
+      };
+      const res = await bg({ type: "setServerConfig", config });
+      setStatus(res?.success ? "✓ 已保存" : "✗ 保存失败", res?.success ? "ok" : "err");
+    } catch {
+      setStatus("✗ 无法连接本地服务", "err");
+    }
+
+    showDirHint(isCustom);
+    if (!isCustom) $("outputDir").value = globalOutputDir;
+  } else {
+    // Global config
+    try {
+      const config = { outputDir: dir || "./outputs" };
+      const res = await bg({ type: "setServerConfig", config });
+      if (res?.success) {
+        globalOutputDir = config.outputDir;
+        setStatus("✓ 已同步到服务器", "ok");
+      } else {
+        setStatus("✗ 保存失败", "err");
+      }
+    } catch {
+      setStatus("✗ 无法连接本地服务", "err");
+    }
+  }
+}
+
+/** Push chatHtml change (always global). */
+async function pushChatHtmlConfig() {
+  try {
+    const config = { chatHtml: $("chatHtml").checked };
+    const res = await bg({ type: "setServerConfig", config });
+    setStatus(res?.success ? "✓ 已同步到服务器" : "✗ 保存失败", res?.success ? "ok" : "err");
+  } catch {
+    setStatus("✗ 无法连接本地服务", "err");
+  }
+}
+
 function attachListeners() {
   // ── Tracking toggle → send to active tab's content script ───
   $("trackingToggle").addEventListener("change", async () => {
     const enabled = $("trackingToggle").checked;
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (!tab?.id) return;
-      chrome.tabs.sendMessage(tab.id, { type: "setTracking", enabled });
+      if (tab?.id) chrome.tabs.sendMessage(tab.id, { type: "setTracking", enabled });
     } catch {
       // ignore
     }
@@ -129,15 +237,15 @@ function attachListeners() {
   $("host").addEventListener("input", debounceConn);
   $("port").addEventListener("input", debounceConn);
 
-  // ── Server config: outputDir (debounced) ────────────────────
+  // ── Output dir (debounced) ──────────────────────────────────
   let dirTimer;
   $("outputDir").addEventListener("input", () => {
     clearTimeout(dirTimer);
-    dirTimer = setTimeout(() => pushServerConfig(), 800);
+    dirTimer = setTimeout(() => pushDirConfig(), 800);
   });
 
-  // ── Server config: chatHtml (immediate) ─────────────────────
-  $("chatHtml").addEventListener("change", () => pushServerConfig());
+  // ── Chat HTML (immediate, always global) ────────────────────
+  $("chatHtml").addEventListener("change", () => pushChatHtmlConfig());
 
   // ── Browse directory button ─────────────────────────────────
   $("browseDir").addEventListener("click", async () => {
@@ -149,7 +257,7 @@ function attachListeners() {
       const res = await bg({ type: "browseDirectory", initialDir: currentDir });
       if (res?.success && res.data?.selected) {
         $("outputDir").value = res.data.selected;
-        pushServerConfig();
+        await pushDirConfig();
       } else if (res?.success && res.data?.cancelled) {
         setStatus("✓ 本地服务已连接", "ok");
       } else {
@@ -161,24 +269,12 @@ function attachListeners() {
       btn.disabled = false;
     }
   });
-}
 
-/** Push outputDir + chatHtml to the running server. */
-async function pushServerConfig() {
-  const config = {
-    outputDir: $("outputDir").value.trim() || "./outputs",
-    chatHtml: $("chatHtml").checked,
-  };
-  try {
-    const res = await bg({ type: "setServerConfig", config });
-    if (res && res.success) {
-      setStatus("✓ 已同步到服务器", "ok");
-    } else {
-      setStatus("✗ 保存失败", "err");
-    }
-  } catch {
-    setStatus("✗ 无法连接本地服务", "err");
-  }
+  // ── Reset dir to global default ─────────────────────────────
+  $("resetDir").addEventListener("click", async () => {
+    $("outputDir").value = globalOutputDir;
+    await pushDirConfig();
+  });
 }
 
 /** Broadcast extension-local settings to content scripts. */
