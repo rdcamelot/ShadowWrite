@@ -16,6 +16,8 @@ const $ = (id) => document.getElementById(id);
 
 let activeConversationId = null;
 let globalOutputDir = "";
+let isClipMode = false;   // true when on a non-AI page (hidden clip feature)
+let currentTabId = null;
 
 // ── Helpers ───────────────────────────────────────────────────────
 
@@ -66,6 +68,7 @@ async function loadSettings() {
 /**
  * Query the active tab's content script for the current
  * tracking state and extract conversationId.
+ * On non-AI pages (no content script), falls back to clip tracking mode.
  */
 function loadTrackingState() {
   const toggle = $("trackingToggle");
@@ -77,13 +80,22 @@ function loadTrackingState() {
         resolve();
         return;
       }
-      chrome.tabs.sendMessage(tab.id, { type: "getTrackingState" }, (resp) => {
+      currentTabId = tab.id;
+      chrome.tabs.sendMessage(tab.id, { type: "getTrackingState" }, async (resp) => {
         if (chrome.runtime.lastError || !resp) {
-          toggle.checked = false;
-          toggle.disabled = true;
+          // No AI-platform content script → clip tracking mode
+          isClipMode = true;
+          toggle.disabled = false;
+          try {
+            const clipResp = await bg({ type: "getClipTrackingState", tabId: tab.id });
+            toggle.checked = !!clipResp?.isTracking;
+          } catch {
+            toggle.checked = false;
+          }
           resolve();
           return;
         }
+        isClipMode = false;
         toggle.disabled = !resp.hasConversation;
         toggle.checked = !!resp.isTracking;
         activeConversationId = resp.conversationId || null;
@@ -205,9 +217,28 @@ async function pushChatHtmlConfig() {
 }
 
 function attachListeners() {
-  // ── Tracking toggle → send to active tab's content script ───
+  // ── Tracking toggle ─────────────────────────────────────────────
   $("trackingToggle").addEventListener("change", async () => {
     const enabled = $("trackingToggle").checked;
+
+    if (isClipMode) {
+      // Non-AI page: clip tracking via background
+      try {
+        const res = await bg({ type: "setClipTracking", tabId: currentTabId, enabled });
+        if (enabled && res?.ok) {
+          setStatus("📎 已剪藏", "ok");
+        } else if (!enabled) {
+          setStatus("✓ 已停止追踪", "ok");
+        } else {
+          setStatus("✗ 剪藏失败: " + (res?.error || ""), "err");
+        }
+      } catch {
+        setStatus("✗ 无法连接本地服务", "err");
+      }
+      return;
+    }
+
+    // AI platform page: normal tracking toggle
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (tab?.id) chrome.tabs.sendMessage(tab.id, { type: "setTracking", enabled });

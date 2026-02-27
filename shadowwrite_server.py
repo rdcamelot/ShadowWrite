@@ -419,6 +419,10 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
             self._handle_browse_directory()
             return
 
+        if path == "/api/clip":
+            self._handle_clip()
+            return
+
         self._send_json(404, {"error": "Not found"})
 
     def _handle_browse_directory(self):
@@ -457,6 +461,76 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"selected": None, "cancelled": True})
         except Exception as e:
             self._send_json(500, {"error": f"Failed to open dialog: {e}"})
+
+    def _handle_clip(self):
+        """Save a web page clip (article / novel chapter) to local Markdown."""
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length == 0:
+            self._send_json(400, {"error": "Empty body"})
+            return
+        try:
+            raw = self.rfile.read(content_length)
+            payload = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            self._send_json(400, {"error": f"Invalid JSON: {e}"})
+            return
+
+        title = (payload.get("title") or "").strip() or "Untitled"
+        url = payload.get("url", "")
+        content = payload.get("content", "")
+        domain = payload.get("domain", "")
+        category = payload.get("category", "clips")
+
+        if not content:
+            self._send_json(400, {"error": "No content to save"})
+            return
+
+        group = payload.get("group", "")
+
+        # Path: {output_dir}/{category}/{domain}[/{group}]/{title}.md
+        safe_cat = sanitize_filename(category) or "clips"
+        safe_domain = sanitize_filename(domain) if domain else "misc"
+        safe_group = sanitize_filename(group) if group else ""
+        safe_title = sanitize_filename(title)
+
+        if safe_group:
+            clip_dir = self.output_dir / safe_cat / safe_domain / safe_group
+        else:
+            clip_dir = self.output_dir / safe_cat / safe_domain
+        md_path = clip_dir / f"{safe_title}.md"
+
+        clip_dir.mkdir(parents=True, exist_ok=True)
+
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if md_path.exists():
+            # Append mode — same title from same domain, append with separator
+            with md_path.open("a", encoding="utf-8") as fh:
+                fh.write(f"\n\n---\n\n<!-- clip: appended at {ts} -->\n\n")
+                fh.write(content)
+            mode = "appended"
+        else:
+            # New file — write header + content
+            header = (
+                f"# {title}\n\n"
+                f"- Source: {url}\n"
+                f"- Clipped: {ts}\n"
+                f"- Domain: {domain}\n\n"
+                "---\n\n"
+            )
+            md_path.write_text(header + content, encoding="utf-8")
+            mode = "created"
+
+        self.log_message(
+            "  [clip] %s %s → %s (%d chars)",
+            mode, safe_title, md_path.parent.name, len(content),
+        )
+        self._send_json(200, {
+            "status": "ok",
+            "mode": mode,
+            "path": str(md_path),
+            "title": title,
+        })
 
     def _rename_conversation_files(
         self,
