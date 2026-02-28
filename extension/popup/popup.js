@@ -53,10 +53,13 @@ async function loadSettings() {
     host: "127.0.0.1",
     port: 24601,
     autoCapture: true,
+    contextMode: "off",
   });
   $("autoCapture").checked = local.autoCapture;
   $("host").value = local.host;
   $("port").value = local.port;
+  $("contextMode").value = local.contextMode || "off";
+  updateContextButtons(local.contextMode || "off");
 
   // 2. Query active tab for tracking state + conversationId
   await loadTrackingState();
@@ -306,6 +309,62 @@ function attachListeners() {
     $("outputDir").value = globalOutputDir;
     await pushDirConfig();
   });
+
+  // ── Context mode ────────────────────────────────────────────
+  $("contextMode").addEventListener("change", async () => {
+    const mode = $("contextMode").value;
+    await chrome.storage.sync.set({ contextMode: mode });
+
+    // Tell active content script
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab?.id) chrome.tabs.sendMessage(tab.id, { type: "setContextMode", mode });
+    } catch { /* ignore */ }
+
+    updateContextButtons(mode);
+  });
+
+  // ── Inject context button ──────────────────────────────────
+  $("injectCtxBtn").addEventListener("click", async () => {
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab?.id) {
+        const res = await new Promise((resolve) => {
+          chrome.tabs.sendMessage(tab.id, { type: "injectContextVisible" }, resolve);
+        });
+        setStatus(res?.ok ? "✓ 已注入上下文" : "✗ 未找到输入框", res?.ok ? "ok" : "err");
+      }
+    } catch {
+      setStatus("✗ 无法连接到页面", "err");
+    }
+  });
+
+  // ── Summarize button ───────────────────────────────────────
+  $("summarizeBtn").addEventListener("click", async () => {
+    if (!activeConversationId) {
+      setStatus("✗ 没有活动对话", "err");
+      return;
+    }
+    $("summarizeBtn").disabled = true;
+    setStatus("正在生成摘要…", "");
+    try {
+      const res = await bg({ type: "summarizeContext", conversationId: activeConversationId });
+      if (res?.success) {
+        setStatus(`✓ 摘要已生成 (${res.data?.length || 0} 字)`, "ok");
+      } else {
+        setStatus("✗ " + (res?.data?.error || res?.error || "生成失败"), "err");
+      }
+    } catch {
+      setStatus("✗ 无法连接本地服务", "err");
+    } finally {
+      $("summarizeBtn").disabled = false;
+    }
+  });
+}
+
+function updateContextButtons(mode) {
+  $("injectCtxBtn").style.display = mode === "inject" ? "" : "none";
+  $("summarizeBtn").style.display = mode === "auto-summary" ? "" : "none";
 }
 
 /** Broadcast extension-local settings to content scripts. */
@@ -316,6 +375,7 @@ function broadcastLocal() {
       host: $("host").value.trim() || "127.0.0.1",
       port: parseInt($("port").value, 10) || 24601,
       autoCapture: $("autoCapture").checked,
+      contextMode: $("contextMode").value || "off",
     },
   });
 }

@@ -61,6 +61,12 @@
       };
 
       this._contextInvalidated = false;
+
+      // Context injection state
+      this._contextMode = "off";         // "off" | "inject" | "auto-summary"
+      this._contextContent = "";         // cached context file content
+      this._submitHooked = false;        // whether hidden inject is active
+      this._origSubmitHandler = null;    // ref for cleanup
     }
 
     /* ==============================================================
@@ -191,8 +197,10 @@
           port: DEFAULT_PORT,
           autoCapture: true,
           enabled: true,
+          contextMode: "off",
         });
         Object.assign(this.settings, result);
+        this._contextMode = result.contextMode || "off";
       } catch {
         // Defaults already set
       }
@@ -273,6 +281,11 @@
       // Start capturing
       this._captureAndSend();
       this._setupMutationObserver();
+
+      // Setup hidden context inject if mode is "inject"
+      if (this._contextMode === "inject") {
+        this._setupHiddenInject();
+      }
     }
 
     /**
@@ -300,6 +313,7 @@
         this.contentObserver.disconnect();
         this.contentObserver = null;
       }
+      this._teardownHiddenInject();
     }
 
     /* -------------------------------------------------------------- */
@@ -496,8 +510,281 @@
             }
             sendResponse({ ok: true });
             break;
+
+          // Context mode changed from popup
+          case "setContextMode": {
+            const newMode = message.mode || "off";
+            this._contextMode = newMode;
+            if (newMode === "inject" && this.isTracking) {
+              this._setupHiddenInject();
+            } else {
+              this._teardownHiddenInject();
+            }
+            sendResponse({ ok: true });
+            break;
+          }
+
+          // Popup requests visible context injection
+          case "injectContextVisible":
+            (async () => {
+              const ok = await this.injectContextVisible();
+              sendResponse({ ok });
+            })();
+            return true; // async response
+
+          // Popup requests context mode info
+          case "getContextMode":
+            sendResponse({
+              mode: this._contextMode,
+              hasConversation: !!this.currentConversationId,
+            });
+            break;
         }
       });
+    }
+
+    /* -------------------------------------------------------------- */
+    /*  Context Injection (Scheme 2 & 4)                                */
+    /* -------------------------------------------------------------- */
+
+    // ── Context-update marker regexes (same as CLI) ────────────
+
+    static _CONTEXT_BLOCK_RE =
+      /<!--\s*context-update-start\s*-->\s*?\n([\s\S]*?)\n\s*?<!--\s*context-update-end\s*-->/g;
+    static _CONTEXT_INLINE_RE =
+      /<!--\s*context-update:\s*([\s\S]*?)\s*-->/g;
+
+    /**
+     * Build the context prefix to prepend to user messages.
+     * Mirrors CLI's build_system_prompt().
+     */
+    _buildContextPrefix() {
+      const parts = [];
+      if (this._contextContent) {
+        parts.push(
+          `=== PROJECT CONTEXT ===\n${this._contextContent}\n=== END PROJECT CONTEXT ===`
+        );
+      }
+      parts.push(
+        "IMPORTANT: A persistent context file is attached to this session.\n" +
+        "This file is the LONG-TERM MEMORY that survives context window truncation.\n" +
+        "When the conversation grows long, early messages will be lost, but this\n" +
+        "file's content will always be re-injected.\n\n" +
+        "Two marker formats are available:\n\n" +
+        "1) STRUCTURED BLOCK (preferred for rich content):\n" +
+        "<!-- context-update-start -->\n" +
+        "## Section Heading\n" +
+        "- Specific detail 1\n" +
+        "<!-- context-update-end -->\n\n" +
+        "2) INLINE note:\n" +
+        "<!-- context-update: concise description -->\n\n" +
+        "Only emit markers for genuinely important information that should be preserved long-term."
+      );
+      return parts.join("\n\n");
+    }
+
+    /**
+     * Fetch the latest context content from server.
+     */
+    async _fetchContext() {
+      if (!this.currentConversationId) return "";
+      try {
+        const resp = await chrome.runtime.sendMessage({
+          type: "getContext",
+          conversationId: this.currentConversationId,
+        });
+        if (resp?.success && resp.data) {
+          this._contextContent = resp.data.content || "";
+          return this._contextContent;
+        }
+      } catch (err) {
+        if (this._handleContextInvalidated(err)) return "";
+        console.warn("[ShadowWrite] Failed to fetch context:", err.message);
+      }
+      return "";
+    }
+
+    /**
+     * Extract context-update markers from AI response content
+     * and post incremental updates to the server.
+     */
+    async _extractAndSaveContextUpdates(messages) {
+      if (this._contextMode === "off") return;
+      if (!this.currentConversationId) return;
+
+      const blocks = [];
+      const inlines = [];
+
+      for (const msg of messages) {
+        if (msg.sender !== "AI") continue;
+        const text = msg.content || "";
+
+        // Block markers
+        let match;
+        const blockRe = new RegExp(BaseShadowWriteAdapter._CONTEXT_BLOCK_RE.source, "g");
+        while ((match = blockRe.exec(text)) !== null) {
+          blocks.push(match[1]);
+        }
+
+        // Inline markers (exclude those inside blocks)
+        const textWithoutBlocks = text.replace(BaseShadowWriteAdapter._CONTEXT_BLOCK_RE, "");
+        const inlineRe = new RegExp(BaseShadowWriteAdapter._CONTEXT_INLINE_RE.source, "g");
+        while ((match = inlineRe.exec(textWithoutBlocks)) !== null) {
+          inlines.push(match[1]);
+        }
+      }
+
+      if (blocks.length === 0 && inlines.length === 0) return;
+
+      console.log(`[ShadowWrite] Extracted ${blocks.length} blocks, ${inlines.length} inline context updates`);
+
+      try {
+        await chrome.runtime.sendMessage({
+          type: "postContext",
+          payload: {
+            conversationId: this.currentConversationId,
+            blocks,
+            inlines,
+          },
+        });
+      } catch (err) {
+        if (this._handleContextInvalidated(err)) return;
+        console.warn("[ShadowWrite] Failed to save context updates:", err.message);
+      }
+    }
+
+    /* ── Hidden inject: hook the submit button/Enter key ─────── */
+
+    /**
+     * Override in subclasses to provide platform-specific input element.
+     * Return the chat input element (textarea / contenteditable div), or null.
+     */
+    getInputElement() {
+      return null;
+    }
+
+    /**
+     * Override in subclasses to provide platform-specific submit trigger.
+     * Return the send button element, or null.
+     */
+    getSubmitButton() {
+      return null;
+    }
+
+    /**
+     * Set text in the platform input box (handles both textarea and contenteditable).
+     */
+    _setInputText(el, text) {
+      if (!el) return;
+      if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
+        // For React-controlled textareas, we need to use native input setter
+        const nativeSetter = Object.getOwnPropertyDescriptor(
+          window.HTMLTextAreaElement.prototype, "value"
+        )?.set || Object.getOwnPropertyDescriptor(
+          window.HTMLInputElement.prototype, "value"
+        )?.set;
+        if (nativeSetter) {
+          nativeSetter.call(el, text);
+        } else {
+          el.value = text;
+        }
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+      } else {
+        // contenteditable div (ChatGPT uses ProseMirror)
+        el.textContent = text;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+    }
+
+    /**
+     * Get current text from the platform input box.
+     */
+    _getInputText(el) {
+      if (!el) return "";
+      if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
+        return el.value;
+      }
+      return el.textContent || el.innerText || "";
+    }
+
+    /**
+     * Setup hidden inject: intercept Enter key to prepend context before sending.
+     */
+    _setupHiddenInject() {
+      if (this._submitHooked) return;
+      this._submitHooked = true;
+
+      this._origSubmitHandler = async (e) => {
+        // Only intercept Enter without Shift (most platforms send on Enter)
+        if (e.key !== "Enter" || e.shiftKey) return;
+
+        const inputEl = this.getInputElement();
+        if (!inputEl || inputEl !== e.target) return;
+        if (this._contextMode !== "inject") return;
+
+        const userText = this._getInputText(inputEl).trim();
+        if (!userText) return;
+
+        // Fetch latest context
+        await this._fetchContext();
+        if (!this._contextContent) return; // nothing to inject
+
+        // Prevent the original send
+        e.preventDefault();
+        e.stopImmediatePropagation();
+
+        const prefix = this._buildContextPrefix();
+        const fullText = `${prefix}\n\n---\n\n${userText}`;
+
+        // Set combined text and trigger send
+        this._setInputText(inputEl, fullText);
+
+        // Small delay to let the framework pick up the change, then click send
+        await new Promise((r) => setTimeout(r, 50));
+        const sendBtn = this.getSubmitButton();
+        if (sendBtn) {
+          sendBtn.click();
+        } else {
+          // Fallback: dispatch Enter event without our handler intercepting it
+          this._submitHooked = false; // temporarily unhook
+          inputEl.dispatchEvent(new KeyboardEvent("keydown", {
+            key: "Enter", code: "Enter", keyCode: 13, bubbles: true
+          }));
+          this._submitHooked = true;
+        }
+      };
+
+      // Use capture phase to intercept before platform handlers
+      document.addEventListener("keydown", this._origSubmitHandler, true);
+      console.log("[ShadowWrite] Hidden context inject hooked");
+    }
+
+    _teardownHiddenInject() {
+      if (!this._submitHooked || !this._origSubmitHandler) return;
+      document.removeEventListener("keydown", this._origSubmitHandler, true);
+      this._submitHooked = false;
+      this._origSubmitHandler = null;
+    }
+
+    /**
+     * Visible inject: fill input box with context prefix + cursor placeholder.
+     * Called from popup "注入上下文" button.
+     */
+    async injectContextVisible() {
+      await this._fetchContext();
+      const prefix = this._buildContextPrefix();
+      const inputEl = this.getInputElement();
+      if (!inputEl) {
+        console.warn("[ShadowWrite] Cannot find input element for context injection");
+        return false;
+      }
+      const current = this._getInputText(inputEl).trim();
+      const text = current
+        ? `${prefix}\n\n---\n\n${current}`
+        : `${prefix}\n\n---\n\n`;
+      this._setInputText(inputEl, text);
+      inputEl.focus();
+      return true;
     }
 
     /* -------------------------------------------------------------- */
@@ -549,6 +836,8 @@
               detail: { count: messages.length },
             })
           );
+          // Extract context-update markers from AI responses
+          this._extractAndSaveContextUpdates(messages);
         } else {
           const errMsg = resp?.error || `Server responded ${resp?.status}: ${resp?.body?.substring(0, 120)}`;
           console.warn(`[ShadowWrite] ${errMsg}`);

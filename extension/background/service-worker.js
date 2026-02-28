@@ -237,6 +237,58 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       })();
       return true;
 
+    // ── Context file API relay ────────────────────────────────
+    case "getContext":
+      (async () => {
+        try {
+          const s = await chrome.storage.sync.get(DEFAULT_SETTINGS);
+          const url = `http://${s.host}:${s.port}/api/context?conversationId=${encodeURIComponent(message.conversationId)}`;
+          const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
+          const data = await resp.json();
+          sendResponse({ success: true, data });
+        } catch (err) {
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
+
+    case "postContext":
+      (async () => {
+        try {
+          const s = await chrome.storage.sync.get(DEFAULT_SETTINGS);
+          const url = `http://${s.host}:${s.port}/api/context`;
+          const resp = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(message.payload),
+          });
+          const data = await resp.json();
+          sendResponse({ success: resp.ok, data });
+        } catch (err) {
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
+
+    case "summarizeContext":
+      (async () => {
+        try {
+          const s = await chrome.storage.sync.get(DEFAULT_SETTINGS);
+          const url = `http://${s.host}:${s.port}/api/context/summarize`;
+          const resp = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ conversationId: message.conversationId }),
+            signal: AbortSignal.timeout(120000),
+          });
+          const data = await resp.json();
+          sendResponse({ success: resp.ok, data });
+        } catch (err) {
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
+
     // ── Clip tracking (popup-based, hidden feature) ────────────
     case "getClipTrackingState": {
       const qTabId = message.tabId || tabId;

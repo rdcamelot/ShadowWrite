@@ -37,6 +37,12 @@ from pathlib import Path
 from typing import Any, Dict, List
 from urllib.parse import parse_qs, urlparse
 
+try:
+    from urllib.request import Request, urlopen
+    from urllib.error import URLError
+except ImportError:
+    pass  # should always be available in stdlib
+
 # Pre-import tkinter so the browse-directory dialog opens faster.
 # If tkinter is unavailable (rare), we simply skip — the browse
 # endpoint will return an error at call time.
@@ -401,6 +407,10 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
             self._send_json(200, response)
             return
 
+        if path == "/api/context":
+            self._handle_context_get()
+            return
+
         self._send_json(404, {"error": "Not found"})
 
     # ── POST endpoints ────────────────────────────────────────────
@@ -423,7 +433,245 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
             self._handle_clip()
             return
 
+        if path == "/api/context":
+            self._handle_context_post()
+            return
+
+        if path == "/api/context/summarize":
+            self._handle_context_summarize()
+            return
+
         self._send_json(404, {"error": "Not found"})
+
+    # ── Context file helpers ──────────────────────────────────────
+
+    def _context_path_for(self, conversation_id: str) -> Path | None:
+        """Derive the .context.md path from conversation meta."""
+        meta = self.state.get_meta(conversation_id)
+        if not meta:
+            return None
+        md_path = Path(meta["md_path"])
+        return md_path.parent / f"{md_path.stem}.context.md"
+
+    def _handle_context_get(self):
+        """GET /api/context?conversationId=xxx — return context content."""
+        query = parse_qs(urlparse(self.path).query)
+        conv_id = query.get("conversationId", [None])[0]
+        if not conv_id:
+            self._send_json(400, {"error": "Missing conversationId"})
+            return
+
+        ctx_path = self._context_path_for(conv_id)
+        if not ctx_path:
+            self._send_json(200, {"content": "", "exists": False, "path": ""})
+            return
+
+        content = ""
+        if ctx_path.exists():
+            try:
+                content = ctx_path.read_text(encoding="utf-8")
+            except OSError:
+                pass
+        self._send_json(200, {
+            "content": content,
+            "exists": ctx_path.exists(),
+            "path": str(ctx_path),
+        })
+
+    def _handle_context_post(self):
+        """POST /api/context — update context file content or apply incremental updates."""
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length == 0:
+            self._send_json(400, {"error": "Empty body"})
+            return
+
+        try:
+            raw = self.rfile.read(content_length)
+            payload = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            self._send_json(400, {"error": f"Invalid JSON: {e}"})
+            return
+
+        conv_id = payload.get("conversationId", "")
+        if not conv_id:
+            self._send_json(400, {"error": "Missing conversationId"})
+            return
+
+        ctx_path = self._context_path_for(conv_id)
+        if not ctx_path:
+            self._send_json(404, {"error": "Conversation not found"})
+            return
+
+        # Full replace mode
+        if "content" in payload:
+            ctx_path.parent.mkdir(parents=True, exist_ok=True)
+            ctx_path.write_text(payload["content"], encoding="utf-8")
+            self.log_message("  [context] Updated: %s", ctx_path.name)
+            self._send_json(200, {"status": "ok", "path": str(ctx_path)})
+            return
+
+        # Incremental append mode (context-update markers extracted by extension)
+        blocks = payload.get("blocks", [])
+        inlines = payload.get("inlines", [])
+        if not blocks and not inlines:
+            self._send_json(200, {"status": "ok", "count": 0})
+            return
+
+        ctx_path.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        parts: list[str] = []
+        for blk in blocks:
+            parts.append(blk.strip())
+            parts.append("")
+        for upd in inlines:
+            parts.append(f"- [{ts}] {upd.strip()}")
+
+        with ctx_path.open("a", encoding="utf-8") as fh:
+            fh.write("\n" + "\n".join(parts) + "\n")
+
+        count = len(blocks) + len(inlines)
+        self.log_message("  [context] Appended %d updates: %s", count, ctx_path.name)
+        self._send_json(200, {"status": "ok", "count": count})
+
+    def _handle_context_summarize(self):
+        """POST /api/context/summarize — use API to auto-summarize conversation into context.
+
+        Reads the current .md file, calls an LLM API to produce a structured summary,
+        and writes/overwrites the .context.md file.
+        """
+        content_length = int(self.headers.get("Content-Length", 0))
+        try:
+            raw = self.rfile.read(content_length) if content_length else b"{}"
+            payload = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            self._send_json(400, {"error": f"Invalid JSON: {e}"})
+            return
+
+        conv_id = payload.get("conversationId", "")
+        if not conv_id:
+            self._send_json(400, {"error": "Missing conversationId"})
+            return
+
+        meta = self.state.get_meta(conv_id)
+        if not meta:
+            self._send_json(404, {"error": "Conversation not found"})
+            return
+
+        md_path = Path(meta["md_path"])
+        if not md_path.exists():
+            self._send_json(404, {"error": "Conversation file not found"})
+            return
+
+        # Read conversation content (truncate if huge)
+        try:
+            md_content = md_path.read_text(encoding="utf-8")
+        except OSError as e:
+            self._send_json(500, {"error": f"Cannot read file: {e}"})
+            return
+
+        # Truncate to ~12000 chars to stay within typical context windows
+        max_chars = 12000
+        if len(md_content) > max_chars:
+            md_content = md_content[-max_chars:]
+
+        # Resolve API config from environment
+        provider = os.environ.get("SHADOWWRITE_PROVIDER", "openai_compat")
+        if provider == "gemini":
+            api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY", "")
+            model = os.environ.get("SHADOWWRITE_MODEL", "gemini-2.0-flash")
+            base_url = os.environ.get("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
+        else:
+            api_key = (
+                os.environ.get("OPENAI_API_KEY")
+                or os.environ.get("DEEPSEEK_API_KEY", "")
+            )
+            model = os.environ.get("SHADOWWRITE_MODEL", "gpt-4o-mini")
+            base_url = (
+                os.environ.get("OPENAI_BASE_URL")
+                or os.environ.get("DEEPSEEK_BASE_URL", "")
+                or "https://api.openai.com/v1"
+            )
+
+        if not api_key:
+            self._send_json(400, {
+                "error": "No API key configured. Set OPENAI_API_KEY / GEMINI_API_KEY in .env"
+            })
+            return
+
+        summarize_prompt = (
+            "你是一个上下文摘要助手。下面是一段 AI 对话记录（Markdown 格式）。\\n"
+            "请提取其中所有重要的、需要长期记住的信息，生成一份结构化的上下文摘要。\\n\\n"
+            "要求：\\n"
+            "- 使用 Markdown 格式，按主题分节（## 标题）\\n"
+            "- 保留具体数值、名称、决策、设定等细节\\n"
+            "- 区分「已确定」和「待定/讨论中」的信息\\n"
+            "- 简洁但不遗漏关键信息\\n"
+            "- 只输出摘要内容，不要输出任何解释\\n\\n"
+            "对话记录：\\n"
+            f"{md_content}"
+        )
+
+        try:
+            if provider == "gemini":
+                summary = self._call_gemini_api(api_key, model, base_url, summarize_prompt)
+            else:
+                summary = self._call_openai_api(api_key, model, base_url, summarize_prompt)
+        except Exception as e:
+            self.log_message("  [context/summarize] API error: %s", e)
+            self._send_json(500, {"error": f"API call failed: {e}"})
+            return
+
+        # Write context file
+        ctx_path = md_path.parent / f"{md_path.stem}.context.md"
+        ctx_path.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        header = f"<!-- Auto-summarized by ShadowWrite at {ts} -->\\n\\n"
+        ctx_path.write_text(header + summary.strip() + "\\n", encoding="utf-8")
+
+        self.log_message("  [context/summarize] Generated %d chars for %s", len(summary), ctx_path.name)
+        self._send_json(200, {
+            "status": "ok",
+            "path": str(ctx_path),
+            "length": len(summary),
+        })
+
+    @staticmethod
+    def _call_openai_api(api_key: str, model: str, base_url: str, prompt: str) -> str:
+        """Call OpenAI-compatible chat completions API (stdlib only)."""
+        endpoint = f"{base_url.rstrip('/')}/chat/completions"
+        body = json.dumps({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 2000,
+        }).encode("utf-8")
+        req = Request(endpoint, data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", f"Bearer {api_key}")
+        with urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        choices = data.get("choices", [])
+        if not choices:
+            raise RuntimeError("API returned no choices")
+        return choices[0]["message"]["content"]
+
+    @staticmethod
+    def _call_gemini_api(api_key: str, model: str, base_url: str, prompt: str) -> str:
+        """Call Gemini generateContent API (stdlib only)."""
+        endpoint = f"{base_url.rstrip('/')}/models/{model}:generateContent?key={api_key}"
+        body = json.dumps({
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2000},
+        }).encode("utf-8")
+        req = Request(endpoint, data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        with urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        candidates = data.get("candidates", [])
+        if not candidates:
+            raise RuntimeError("Gemini returned no candidates")
+        parts = candidates[0].get("content", {}).get("parts", [])
+        return parts[0]["text"] if parts else ""
 
     def _handle_browse_directory(self):
         """Open a native directory-picker dialog and return the selected path."""

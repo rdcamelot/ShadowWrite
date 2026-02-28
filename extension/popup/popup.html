@@ -67,6 +67,40 @@
       width: 32px; height: 18px;
       flex-shrink: 0;
     }
+
+    /* ── Select (dropdown) ───────────────────────── */
+    .sel {
+      background: #1c1c26;
+      border: 1px solid #2a2a36;
+      border-radius: 6px;
+      color: #c0c0c8;
+      font-size: 11px;
+      padding: 3px 6px;
+      outline: none;
+      font-family: inherit;
+      cursor: pointer;
+      transition: border-color 0.2s;
+    }
+    .sel:focus { border-color: #e8a048; }
+    .sel option { background: #16161e; }
+
+    /* ── Small action button ─────────────────────── */
+    .act-btn {
+      display: block;
+      width: 100%;
+      padding: 6px 0;
+      margin-top: 6px;
+      background: #1c1c26;
+      border: 1px solid #2a2a36;
+      border-radius: 6px;
+      color: #a0a0a8;
+      font-size: 11px;
+      font-family: inherit;
+      cursor: pointer;
+      transition: border-color 0.2s, color 0.2s;
+    }
+    .act-btn:hover { border-color: #e8a048; color: #e8a048; }
+    .act-btn:disabled { opacity: 0.4; cursor: default; }
     .sw input { opacity: 0; width: 0; height: 0; position: absolute; }
     .sl {
       position: absolute; inset: 0;
@@ -218,6 +252,27 @@
       <span>生成 Chat HTML</span>
       <label class="sw"><input type="checkbox" id="chatHtml"><span class="sl"></span></label>
     </div>
+  </div>
+
+  <div class="d"></div>
+
+  <!-- Context -->
+  <div class="sec" id="contextSection">
+    <div class="sec-l">上下文记忆</div>
+    <div class="tg">
+      <span>模式</span>
+      <select class="sel" id="contextMode">
+        <option value="off">关闭</option>
+        <option value="inject">注入 (方案二)</option>
+        <option value="auto-summary">自动摘要 (方案四)</option>
+      </select>
+    </div>
+    <div class="hint" style="margin-top:4px">
+      注入：AI 回复中的 context-update 标记自动保存到本地<br>
+      摘要：用 API 自动总结对话为上下文文件
+    </div>
+    <button class="act-btn" id="injectCtxBtn" style="display:none">📋 注入上下文到输入框</button>
+    <button class="act-btn" id="summarizeBtn" style="display:none">🤖 生成/更新摘要</button>
   </div>
 
   <div class="ft">silent sync · local markdown</div>

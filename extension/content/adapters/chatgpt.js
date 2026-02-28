@@ -122,6 +122,19 @@
         title: fullTitle.substring(sep + 3).trim(),
       };
     }
+
+    /* ---- Input element hooks for context injection ---- */
+
+    getInputElement() {
+      // ChatGPT uses a ProseMirror contenteditable div inside the composer
+      return document.querySelector("#prompt-textarea")
+        || document.querySelector('div[contenteditable="true"]');
+    }
+
+    getSubmitButton() {
+      return document.querySelector('button[data-testid="send-button"]')
+        || document.querySelector('form button[type="submit"]');
+    }
   }
 
   /* ---- Bootstrap ---- */

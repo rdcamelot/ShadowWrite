@@ -122,6 +122,20 @@
         node.closest?.("model-response") !== null
       );
     }
+
+    /* ---- Input element hooks for context injection ---- */
+
+    getInputElement() {
+      // Gemini uses a rich text editor
+      return document.querySelector('.ql-editor[contenteditable="true"]')
+        || document.querySelector('rich-textarea .text-input-field')
+        || document.querySelector('div[contenteditable="true"]');
+    }
+
+    getSubmitButton() {
+      return document.querySelector('button.send-button')
+        || document.querySelector('button[aria-label="Send message"]');
+    }
   }
 
   const adapter = new GeminiAdapter();
