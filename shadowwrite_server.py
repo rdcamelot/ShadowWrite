@@ -539,6 +539,7 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
         new_display: str,
         platform: str,
         base_dir: Path | None = None,
+        project: str | None = None,
     ) -> tuple[Path | None, Path | None]:
         """Rename conversation files + directory when title changes.
 
@@ -547,7 +548,10 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
         try:
             old_dir = md_path.parent
             dir_name = sanitize_filename(platform)
-            new_dir = (base_dir or self.output_dir) / dir_name / sanitize_filename(new_display)
+            parent = (base_dir or self.output_dir) / dir_name
+            if project and project.strip():
+                parent = parent / sanitize_filename(project.strip())
+            new_dir = parent / sanitize_filename(new_display)
 
             if new_dir.exists() and new_dir != old_dir:
                 self.log_message("  [rename] Target dir already exists, skipping: %s", new_dir)
@@ -583,6 +587,7 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
         html_path: Path,
         new_base_dir: Path,
         platform: str,
+        project: str | None = None,
     ) -> tuple[Path | None, Path | None]:
         """Move conversation files to a different base output directory.
 
@@ -592,7 +597,10 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
             old_dir = md_path.parent
             dir_name = sanitize_filename(platform)
             display_name = md_path.stem
-            new_dir = new_base_dir / dir_name / sanitize_filename(display_name)
+            parent = new_base_dir / dir_name
+            if project and project.strip():
+                parent = parent / sanitize_filename(project.strip())
+            new_dir = parent / sanitize_filename(display_name)
 
             if new_dir == old_dir:
                 return (md_path, html_path)
@@ -727,6 +735,7 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
         title = payload.get("title", "")
         url = payload.get("url", "")
         custom_output_dir = payload.get("outputDir")  # per-conversation override
+        project = payload.get("project")  # ChatGPT project subfolder
 
         if not platform or not conversation_id:
             self._send_json(400, {
@@ -753,11 +762,16 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
                 display_name = sanitize_filename(title.strip())
             else:
                 display_name = sanitize_filename(f"{platform}_{conversation_id}")
-            # Directory: {base_dir}/{platform}/{display_name}/
+            # Directory: {base_dir}/{platform}/[{project}/]{display_name}/
             dir_name = sanitize_filename(platform)
             sub_name = sanitize_filename(display_name)
-            md_path = base_dir / dir_name / sub_name / f"{display_name}.md"
-            html_path = base_dir / dir_name / sub_name / f"{display_name}.chat.html"
+            if project and project.strip():
+                project_dir = sanitize_filename(project.strip())
+                md_path = base_dir / dir_name / project_dir / sub_name / f"{display_name}.md"
+                html_path = base_dir / dir_name / project_dir / sub_name / f"{display_name}.chat.html"
+            else:
+                md_path = base_dir / dir_name / sub_name / f"{display_name}.md"
+                html_path = base_dir / dir_name / sub_name / f"{display_name}.chat.html"
 
             ensure_output_file(md_path, platform, title)
             if self.chat_html:
@@ -771,6 +785,8 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
                 "html_path": str(html_path),
                 "base_dir": str(base_dir),
             }
+            if project and project.strip():
+                meta["project"] = project.strip()
             self.state.set_meta(conversation_id, meta)
         else:
             md_path = Path(meta["md_path"])
@@ -782,6 +798,7 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
                 if md_path.exists():
                     new_md, new_html = self._move_conversation_files(
                         md_path, html_path, base_dir, platform,
+                        project=meta.get("project"),
                     )
                     if new_md:
                         md_path = new_md
@@ -801,6 +818,7 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
                 if new_display and new_display != current_display:
                     new_md, new_html = self._rename_conversation_files(
                         md_path, html_path, new_display, platform, base_dir,
+                        project=meta.get("project"),
                     )
                     if new_md:
                         md_path = new_md

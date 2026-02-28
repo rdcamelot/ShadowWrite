@@ -515,6 +515,13 @@
         messages,
       };
 
+      // ChatGPT project conversations: include project field
+      const projectInfo = this.extractProject?.();
+      if (projectInfo) {
+        payload.project = projectInfo.project;
+        payload.title   = projectInfo.title;
+      }
+
       // Include per-conversation output directory if set
       try {
         const data = await chrome.storage.local.get({ convOutputDirs: {} });

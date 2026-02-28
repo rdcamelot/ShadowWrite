@@ -96,6 +96,32 @@
       const title = document.title?.replace(/ \| ChatGPT$/, "").trim();
       return title || null;
     }
+
+    /**
+     * Detect ChatGPT Project conversations and extract the project name.
+     * Project URL pattern: /g/g-p-{id}-{slug}/c/{conv_id}
+     * Project title format: "project_name - conversation_title"
+     * Returns { project, title } when in a project, null otherwise.
+     */
+    extractProject() {
+      const url = this.pageUrl || window.location.href;
+      // Only project GPTs have /g/g-p- in the URL
+      if (!/\/g\/g-p-/.test(url)) return null;
+
+      const fullTitle = this.extractTitle();
+      if (!fullTitle) return null;
+
+      // Split on first " - " separator
+      const sep = fullTitle.indexOf(" - ");
+      if (sep <= 0) {
+        // No separator — use full title as conv title, slug as project
+        return { project: "project", title: fullTitle };
+      }
+      return {
+        project: fullTitle.substring(0, sep).trim(),
+        title: fullTitle.substring(sep + 3).trim(),
+      };
+    }
   }
 
   /* ---- Bootstrap ---- */

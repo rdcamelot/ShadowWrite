@@ -67,7 +67,7 @@ python shadowwrite_server.py
 
 **第三步：开始追踪**
 
-打开 ChatGPT / Claude / Gemini / DeepSeek / Kimi / 豆包 / 元宝，进入对话。
+打开 ChatGPT 或 Gemini，进入对话。也可打开 Claude / DeepSeek / Kimi / 豆包 / 元宝，但这些平台目前仅有基础支持，适配完善程度不如前两者。
 
 页面右下角出现一个小圆点——**点击它开启/关闭追踪**，也可以通过右上角扩展图标的弹窗来控制：
 
@@ -225,15 +225,17 @@ python shadowwrite_cli.py --no-record --context-file auto
 
 **支持平台：**
 
-| 平台 | 适配器 | 特殊能力 |
-|------|--------|---------|
-| ChatGPT | `chatgpt.js` | — |
-| Claude | `claude.js` | thinking 过滤 |
-| Gemini | `gemini.js` | 智能标题提取 |
-| DeepSeek | `deepseek.js` | thinking 提取 |
-| Kimi | `kimi.js` | — |
-| 豆包 | `doubao.js` | thinking 提取 |
-| 元宝 | `yuanbao.js` | — |
+| 平台 | 适配器 | 支持程度 | 特殊能力 |
+|------|--------|---------|----------|
+| ChatGPT | `chatgpt.js` | ✅ 完善 | 项目对话子目录 |
+| Gemini | `gemini.js` | ✅ 完善 | 智能标题提取 |
+| Claude | `claude.js` | ⚠️ 基础 | thinking 过滤 |
+| DeepSeek | `deepseek.js` | ⚠️ 基础 | thinking 提取 |
+| Kimi | `kimi.js` | ⚠️ 基础 | — |
+| 豆包 | `doubao.js` | ⚠️ 基础 | thinking 提取 |
+| 元宝 | `yuanbao.js` | ⚠️ 基础 | — |
+
+> ⚠️ 基础支持：适配器可正常运行，但 DOM 选择器未经过充分测试，平台前端更新后可能需要调整。
 
 ### 本地 HTTP 服务 (`shadowwrite_server.py`)
 
@@ -285,15 +287,11 @@ ShadowWrite/
 │   ├── content/
 │   │   ├── base-adapter.js
 │   │   ├── content-common.js
-│   │   └── adapters/           ← 7 个平台适配器
+│   │   └── adapters/           ← 平台适配器
 │   ├── popup/
 │   ├── css/
 │   └── icons/
-├── outputs/                    ← 输出目录
-├── docs/
-│   └── DESIGN_NOTES.md         ← 技术调研与方案比较
-├── external/                   ← 参考代码库
-└── test/                       ← Chat Memo 源码分析
+└──outputs/                    ← 输出目录
 ```
 
 ---
@@ -301,6 +299,7 @@ ShadowWrite/
 ## 已知限制
 
 - **懒加载**：部分平台（如 Gemini）对长对话使用虚拟滚动，扩展只能抓取当前 DOM 中已加载的消息。建议开启追踪前先手动滚动到对话顶部。
+- **Gemini Deep Research**：Deep Research 模式生成的报告使用独立渲染组件，当前不支持抓取。
 - **服务须手动启动**：需在终端手动运行 `python shadowwrite_server.py`。
 - **CSS 选择器耦合**：平台前端更新可能导致适配器失效，需更新选择器。
 
@@ -323,12 +322,6 @@ ShadowWrite/
 - [ ] CSS 选择器热更新机制
 
 ---
-
-## 相关文档
-
-- [LOCAL_API_WORKFLOW.md](LOCAL_API_WORKFLOW.md) — CLI 工作流详解
-- [ROUTE3_BASELINE.md](ROUTE3_BASELINE.md) — Chrome 扩展架构设计
-- [docs/DESIGN_NOTES.md](docs/DESIGN_NOTES.md) — 技术调研与方案比较
 
 ## License
 
