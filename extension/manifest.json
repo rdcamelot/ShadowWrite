@@ -71,6 +71,16 @@
       "run_at": "document_idle"
     },
     {
+      "matches": ["https://grok.com/*"],
+      "js": [
+        "content/base-adapter.js",
+        "content/content-common.js",
+        "content/adapters/grok.js"
+      ],
+      "css": ["css/content.css"],
+      "run_at": "document_idle"
+    },
+    {
       "matches": ["https://kimi.moonshot.cn/*", "https://*.kimi.com/*"],
       "js": [
         "content/base-adapter.js",

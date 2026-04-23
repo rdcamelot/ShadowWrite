@@ -30,6 +30,66 @@
       };
     }
 
+    extractTitle() {
+      // Claude sometimes leaves document.title as "Claude"; try visible heading first.
+      const domTitle =
+        document.querySelector('[data-testid="conversation-title"]')?.textContent ||
+        document.querySelector('[data-testid="chat-title"]')?.textContent ||
+        document.querySelector("main h1")?.textContent ||
+        document.title || "";
+
+      const clean = (domTitle || "")
+        .replace(/\s*\|\s*Claude\s*$/i, "")
+        .replace(/\s*-\s*Claude\s*$/i, "")
+        .trim();
+      return clean || null;
+    }
+
+    /**
+     * Best-effort project extraction for Claude.
+     * Priority:
+     * 1) Dedicated project/breadcrumb DOM nodes (if present)
+     * 2) Title pattern: "project / conversation"
+     */
+    extractProject() {
+      const title = this.extractTitle() || "";
+
+      // 1) DOM-based project name candidates (Claude UI may change over time)
+      const projectCandidates = [
+        '[data-testid="project-name"]',
+        '[data-testid="breadcrumb-project"]',
+        'nav a[href*="/project/"]',
+        'nav a[href*="/projects/"]',
+        'a[href*="/project/"]',
+        'a[href*="/projects/"]',
+      ];
+
+      for (const selector of projectCandidates) {
+        const el = document.querySelector(selector);
+        const txt = (el?.textContent || "").trim();
+        if (txt && txt.toLowerCase() !== "projects") {
+          const escaped = txt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const convTitle = title
+            .replace(new RegExp(`^${escaped}\\s*[/｜-]\\s*`), "")
+            .trim() || title;
+          return { project: txt, title: convTitle };
+        }
+      }
+
+      // 2) Fallback: parse title split by slash-like separators
+      const slashMatch = title.match(/^(.+?)\s*[\/｜]\s*(.+)$/);
+      if (slashMatch) {
+        const project = slashMatch[1].trim();
+        const convTitle = slashMatch[2].trim();
+        if (project && convTitle) {
+          return { project, title: convTitle };
+        }
+      }
+
+      // No reliable project signal — keep current flat layout.
+      return null;
+    }
+
     extractMessages() {
       if (this.isInEditMode(document.body)) return [];
 

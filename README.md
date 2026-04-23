@@ -67,7 +67,7 @@ python shadowwrite_server.py
 
 **第三步：开始追踪**
 
-打开 ChatGPT 或 Gemini，进入对话。也可打开 Claude / DeepSeek / Kimi / 豆包 / 元宝，但这些平台目前仅有基础支持，适配完善程度不如前两者。
+打开 ChatGPT 或 Gemini，进入对话。也可打开 Claude / Grok / DeepSeek / Kimi / 豆包 / 元宝，但这些平台目前仅有基础支持，适配完善程度不如前两者。
 
 页面右下角出现一个小圆点——**点击它开启/关闭追踪**，也可以通过右上角扩展图标的弹窗来控制：
 
@@ -196,7 +196,7 @@ python shadowwrite_cli.py --no-record --context-file auto
 │       │                                          │
 │  ┌────┴──────────┐    relay    ┌──────────────┐  │
 │  │ Local Server   │ ←────────  │ Chrome Ext   │  │
-│  │ :24601         │            │ 7 Adapters   │  │
+│  │ :24601         │            │ 8 Adapters   │  │
 │  └───────────────┘             └──────────────┘  │
 │                                                  │
 └─────────────────────────────────────────────────┘
@@ -230,6 +230,7 @@ python shadowwrite_cli.py --no-record --context-file auto
 | ChatGPT | `chatgpt.js` | ✅ 完善 | 项目对话子目录 |
 | Gemini | `gemini.js` | ✅ 完善 | 智能标题提取 |
 | Claude | `claude.js` | ⚠️ 基础 | thinking 过滤 |
+| Grok | `grok.js` | ⚠️ 基础 | API-based 响应提取 |
 | DeepSeek | `deepseek.js` | ⚠️ 基础 | thinking 提取 |
 | Kimi | `kimi.js` | ⚠️ 基础 | — |
 | 豆包 | `doubao.js` | ⚠️ 基础 | thinking 提取 |
