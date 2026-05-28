@@ -216,7 +216,10 @@
     async _loadTrackingState() {
       try {
         const data = await chrome.storage.local.get({ trackedConversations: {} });
-        const entry = data.trackedConversations[this.currentConversationId];
+        const trackedConversations = this._normalizeTrackedConversations(
+          data.trackedConversations
+        );
+        const entry = trackedConversations[this.currentConversationId];
 
         if (entry && !entry.disabled) {
           // Previously tracked — resume
@@ -259,13 +262,16 @@
       if (!this.currentConversationId || this._contextInvalidated) return;
       try {
         const data = await chrome.storage.local.get({ trackedConversations: {} });
-        data.trackedConversations[this.currentConversationId] = {
+        const trackedConversations = this._normalizeTrackedConversations(
+          data.trackedConversations
+        );
+        trackedConversations[this.currentConversationId] = {
           title: this.extractTitle(),
           platform: this.platform,
           url: this.pageUrl,
           enabledAt: new Date().toISOString(),
         };
-        await chrome.storage.local.set(data);
+        await chrome.storage.local.set({ trackedConversations });
       } catch (err) {
         if (this._handleContextInvalidated(err)) return;
         console.warn("[ShadowWrite] Failed to save tracking state:", err);
@@ -295,9 +301,12 @@
       if (!this.currentConversationId || this._contextInvalidated) return;
       try {
         const data = await chrome.storage.local.get({ trackedConversations: {} });
+        const trackedConversations = this._normalizeTrackedConversations(
+          data.trackedConversations
+        );
         // Store disabled marker so autoCapture won't re-enable this conversation
-        data.trackedConversations[this.currentConversationId] = { disabled: true };
-        await chrome.storage.local.set(data);
+        trackedConversations[this.currentConversationId] = { disabled: true };
+        await chrome.storage.local.set({ trackedConversations });
       } catch (err) {
         if (this._handleContextInvalidated(err)) return;
         console.warn("[ShadowWrite] Failed to save tracking state:", err);
@@ -320,19 +329,30 @@
     /*  MutationObserver                                                */
     /* -------------------------------------------------------------- */
 
+    _normalizeTrackedConversations(value) {
+      return value && typeof value === "object" && !Array.isArray(value)
+        ? value
+        : {};
+    }
+
     _setupMutationObserver() {
       if (this.contentObserver) {
         this.contentObserver.disconnect();
       }
 
       this.contentObserver = new MutationObserver((mutations) => {
-        if (!this.settings.autoCapture || !this.isTracking) return;
+        // autoCapture controls whether new conversations are enabled
+        // automatically; it must not suspend an already tracked conversation.
+        if (!this.isTracking) return;
 
         let hasRelevant = false;
         for (const mutation of mutations) {
           if (mutation.type === "childList") {
             for (const node of mutation.addedNodes) {
-              if (node.nodeType === Node.ELEMENT_NODE && this.isMessageElement(node)) {
+              const candidate = node.nodeType === Node.ELEMENT_NODE
+                ? node
+                : mutation.target;
+              if (candidate && this.isMessageElement(candidate)) {
                 hasRelevant = true;
                 break;
               }

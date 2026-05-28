@@ -18,6 +18,7 @@ let activeConversationId = null;
 let globalOutputDir = "";
 let isClipMode = false;   // true when on a non-AI page (hidden clip feature)
 let currentTabId = null;
+let activeScriptUnavailable = false;
 
 // ── Helpers ───────────────────────────────────────────────────────
 
@@ -30,6 +31,23 @@ function setStatus(text, type) {
 /** Send a message to background and return the response. */
 function bg(msg) {
   return new Promise((resolve) => chrome.runtime.sendMessage(msg, resolve));
+}
+
+function isSupportedAiPage(url = "") {
+  return /^https:\/\/(?:chatgpt\.com|chat\.openai\.com|chat\.deepseek\.com|gemini\.google\.com|claude\.ai|grok\.com|kimi\.moonshot\.cn|[^/]+\.kimi\.com|www\.doubao\.com|yuanbao\.tencent\.com)\//.test(url);
+}
+
+function tabMessage(tabId, message) {
+  return new Promise((resolve, reject) => {
+    chrome.tabs.sendMessage(tabId, message, (response) => {
+      const err = chrome.runtime.lastError;
+      if (err) {
+        reject(new Error(err.message));
+        return;
+      }
+      resolve(response);
+    });
+  });
 }
 
 function showDirHint(isCustom) {
@@ -66,6 +84,9 @@ async function loadSettings() {
 
   // 3. Server config (outputDir, chatHtml)
   await loadServerConfig();
+  if (activeScriptUnavailable) {
+    setStatus("Refresh the AI page to load ShadowWrite.", "err");
+  }
 }
 
 /**
@@ -86,8 +107,20 @@ function loadTrackingState() {
       currentTabId = tab.id;
       chrome.tabs.sendMessage(tab.id, { type: "getTrackingState" }, async (resp) => {
         if (chrome.runtime.lastError || !resp) {
+          if (isSupportedAiPage(tab.url || "")) {
+            isClipMode = false;
+            activeScriptUnavailable = true;
+            activeConversationId = null;
+            toggle.checked = false;
+            toggle.disabled = true;
+            setStatus("Refresh the AI page to load ShadowWrite.", "err");
+            resolve();
+            return;
+          }
+
           // No AI-platform content script → clip tracking mode
           isClipMode = true;
+          activeScriptUnavailable = false;
           toggle.disabled = false;
           try {
             const clipResp = await bg({ type: "getClipTrackingState", tabId: tab.id });
@@ -99,6 +132,7 @@ function loadTrackingState() {
           return;
         }
         isClipMode = false;
+        activeScriptUnavailable = false;
         toggle.disabled = !resp.hasConversation;
         toggle.checked = !!resp.isTracking;
         activeConversationId = resp.conversationId || null;
@@ -244,9 +278,12 @@ function attachListeners() {
     // AI platform page: normal tracking toggle
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (tab?.id) chrome.tabs.sendMessage(tab.id, { type: "setTracking", enabled });
-    } catch {
-      // ignore
+      if (!tab?.id) throw new Error("No active tab");
+      const resp = await tabMessage(tab.id, { type: "setTracking", enabled });
+      if (!resp?.ok) throw new Error(resp?.error || "Tracking request failed");
+    } catch (err) {
+      $("trackingToggle").checked = !enabled;
+      setStatus(`Tracking unavailable: ${err.message}`, "err");
     }
   });
 

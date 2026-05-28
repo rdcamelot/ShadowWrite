@@ -116,8 +116,11 @@
     isMessageElement(node) {
       if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
       return (
+        node.matches?.(".conversation-container") ||
         node.matches?.("user-query") ||
         node.matches?.("model-response") ||
+        node.querySelector?.("user-query, model-response") !== null ||
+        node.closest?.(".conversation-container") !== null ||
         node.closest?.("user-query") !== null ||
         node.closest?.("model-response") !== null
       );
