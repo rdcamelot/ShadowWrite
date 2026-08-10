@@ -23,7 +23,7 @@
 
     extractConversationInfo(url) {
       // /gem/{type}/{id}  or  /app/{id}
-      const match = url.match(/\/(gem\/[^/]+\/|app\/)([a-f0-9]+)/);
+      const match = url.match(/\/(gem\/[^/]+\/|app\/)([^/?#]+)/);
       const id = match ? match[2] : url.split("/").pop();
       return {
         conversationId: `gemini_${id}`,
@@ -31,86 +31,204 @@
       };
     }
 
+    getObserverRoot() {
+      return document.querySelector('#chat-history, chat-history, [data-test-id="chat-history"]')
+        || document.querySelector("main")
+        || document.body;
+    }
+
     /**
-     * Extract meaningful conversation title from the DOM title element.
+     * Extract the current conversation title without confusing it with a
+     * different sidebar item or Gemini's temporary first-prompt title.
      */
     extractTitle() {
-      // Primary: dedicated title element in Gemini's sidebar/header
-      const titleEl = document.querySelector('[data-test-id="conversation-title"]');
-      if (titleEl) {
-        const text = (titleEl.innerText || titleEl.textContent || "").trim();
-        if (text && text.length > 2) {
-          return text.length > 80 ? text.substring(0, 80) + "…" : text;
+      // Gemini renders many conversation-title nodes in the sidebar. Scope the
+      // lookup to links whose path exactly matches the current conversation.
+      const currentUrl = this.pageUrl || location.href;
+      let parsedCurrentUrl;
+      try {
+        parsedCurrentUrl = new URL(currentUrl, location.href);
+      } catch {
+        parsedCurrentUrl = null;
+      }
+
+      if (parsedCurrentUrl) {
+        const currentPath = parsedCurrentUrl.pathname.replace(/\/$/, "");
+        const links = Array.from(document.querySelectorAll("a[href]"))
+          .filter((link) => {
+            try {
+              const linkUrl = new URL(link.getAttribute("href"), parsedCurrentUrl);
+              return linkUrl.pathname.replace(/\/$/, "") === currentPath;
+            } catch {
+              return false;
+            }
+          })
+          .sort((a, b) => {
+            const aCurrent = a.getAttribute("aria-current") === "page" ? 1 : 0;
+            const bCurrent = b.getAttribute("aria-current") === "page" ? 1 : 0;
+            return bCurrent - aCurrent;
+          });
+
+        for (const link of links) {
+          const titleEl = link.querySelector(
+            '[data-test-id="conversation-title"], [data-test-id="conversation-title-text"], .conversation-title, [class*="conversation-title"]'
+          );
+          const candidates = [
+            titleEl?.innerText || titleEl?.textContent,
+            link.getAttribute("title"),
+            link.innerText || link.textContent,
+          ];
+          for (const candidate of candidates) {
+            const title = this._normalizeTitleCandidate(candidate);
+            if (title) return title;
+          }
         }
       }
-      // Fallback: page title (filter generic ones)
-      const title = document.title?.trim();
-      if (title && title !== "Gemini" && !title.startsWith("Google") && title.length > 2) {
-        return title.length > 80 ? title.substring(0, 80) + "…" : title;
+
+      // The browser tab is less precise than the active sidebar item, but is a
+      // useful fallback once Gemini has generated a real title.
+      return this._normalizeTitleCandidate(document.title, true);
+    }
+
+    _normalizeTitleCandidate(value, stripBrand = false) {
+      let title = String(value || "").replace(/\s+/g, " ").trim();
+      if (stripBrand) {
+        title = title
+          .replace(/\s*(?:[-–—|]\s*)?(?:Google\s+)?Gemini\s*$/i, "")
+          .trim();
       }
-      return null;
+      title = title
+        .replace(/\s*(?:More options|Open conversation menu|更多选项|打开对话菜单)\s*$/i, "")
+        .trim();
+
+      if (
+        title.length < 2 ||
+        title.length > 80 ||
+        /^(?:Google\s+)?Gemini$/i.test(title) ||
+        /^(?:New chat|Chats?|新对话|对话)$/i.test(title) ||
+        /https?:\/\//i.test(title)
+      ) {
+        return null;
+      }
+
+      const firstQueryEl = document.querySelector(
+        "user-query .query-text, user-query [data-test-id='user-query-content'], user-query .user-query-content, user-query"
+      );
+      const firstQuery = String(firstQueryEl?.innerText || firstQueryEl?.textContent || "")
+        .replace(/^(?:你说|You said)\s*/i, "")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (title.length >= 40 && firstQuery.length >= title.length) {
+        const comparableTitle = title.replace(/…$/, "").trim();
+        if (comparableTitle && firstQuery.startsWith(comparableTitle)) {
+          return null;
+        }
+      }
+
+      return title;
     }
 
     extractMessages() {
-      if (this.isInEditMode(document.body)) return [];
-
       const messages = [];
 
       // Gemini DOM: #chat-history > .conversation-container[]
       // Each container has one user-query + one model-response.
-      const chatHistory = document.querySelector("#chat-history");
-      if (!chatHistory) {
-        console.log("[ShadowWrite] Gemini: #chat-history not found yet.");
+      const chatHistory = document.querySelector(
+        '#chat-history, chat-history, [data-test-id="chat-history"]'
+      ) || document.querySelector("main");
+      if (!chatHistory || !chatHistory.querySelector("user-query, model-response")) {
         return messages;
       }
 
       const blocks = chatHistory.querySelectorAll(".conversation-container");
-      if (blocks.length === 0) {
-        console.log("[ShadowWrite] Gemini: no .conversation-container found.");
-        return messages;
-      }
+      if (blocks.length > 0) {
+        blocks.forEach((block, blockIndex) => {
+          // Skip if user is editing in this block
+          if (this.isInEditMode(block)) return;
 
-      blocks.forEach((block, blockIndex) => {
-        // Skip if user is editing in this block
-        if (this.isInEditMode(block)) return;
-
-        // User message (even position)
-        const userEl = block.querySelector("user-query .query-text");
-        if (userEl) {
-          let content = this.extractFormattedContent(userEl);
-          // Strip Gemini's "你说" / "You said" prefix
-          content = content.replace(/^(你说|You said)\s*/i, "");
-          if (content) {
+          const userContent = this._extractUserContent(block);
+          if (userContent) {
             const pos = blockIndex * 2;
             messages.push({
               messageId: this.generateMessageId("user", pos),
               sender: "user",
-              content,
+              content: userContent,
               thinking: "",
               position: pos,
             });
           }
-        }
 
-        // AI response (odd position)
-        const aiEl = block.querySelector("model-response .model-response-text");
-        if (aiEl) {
-          const content = this.extractFormattedContent(aiEl);
-          if (content) {
+          const aiContent = this._extractAiContent(block);
+          if (aiContent) {
             const pos = blockIndex * 2 + 1;
             messages.push({
               messageId: this.generateMessageId("AI", pos),
               sender: "AI",
-              content,
+              content: aiContent,
               thinking: "",
               position: pos,
+            });
+          }
+        });
+
+        return messages;
+      }
+
+      // Fallback for Gemini DOM variants that no longer wrap turns in
+      // .conversation-container, while preserving visible order.
+      const turns = chatHistory.querySelectorAll("user-query, model-response");
+      turns.forEach((turn, index) => {
+        if (this.isInEditMode(turn)) return;
+        if (turn.matches("user-query")) {
+          const content = this._extractUserContent(turn);
+          if (content) {
+            messages.push({
+              messageId: this.generateMessageId("user", index),
+              sender: "user",
+              content,
+              thinking: "",
+              position: index,
+            });
+          }
+        } else if (turn.matches("model-response")) {
+          const content = this._extractAiContent(turn);
+          if (content) {
+            messages.push({
+              messageId: this.generateMessageId("AI", index),
+              sender: "AI",
+              content,
+              thinking: "",
+              position: index,
             });
           }
         }
       });
 
-      console.log(`[ShadowWrite] Gemini: extracted ${messages.length} messages from ${blocks.length} blocks.`);
       return messages;
+    }
+
+    _extractUserContent(scope) {
+      const userEl = scope.matches?.("user-query")
+        ? scope
+        : scope.querySelector(
+            "user-query .query-text, user-query [data-test-id='user-query-content'], user-query .user-query-content, user-query"
+          );
+      if (!userEl) return "";
+      const content = this.extractFormattedContent(userEl)
+        .replace(/^(你说|You said)\s*/i, "")
+        .trim();
+      return this._stripInjectedContextPrefix(content);
+    }
+
+    _extractAiContent(scope) {
+      const aiEl = scope.matches?.("model-response")
+        ? scope.querySelector(
+            ".model-response-text, .markdown, [data-test-id='response-content']"
+          ) || scope
+        : scope.querySelector(
+            "model-response .model-response-text, model-response .markdown, model-response [data-test-id='response-content'], model-response"
+          );
+      return aiEl ? this.extractFormattedContent(aiEl).trim() : "";
     }
 
     isMessageElement(node) {

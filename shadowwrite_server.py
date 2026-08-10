@@ -23,6 +23,7 @@ python shadowwrite_server.py
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -42,6 +43,95 @@ try:
     from urllib.error import URLError
 except ImportError:
     pass  # should always be available in stdlib
+
+
+APP_VERSION = "0.1.0"
+PROJECT_DIR = Path(__file__).resolve().parent
+EXTENSION_DIR = PROJECT_DIR / "extension"
+EXTENSION_MANIFEST_PATH = EXTENSION_DIR / "manifest.json"
+
+
+def calculate_extension_fingerprint(extension_dir: Path = EXTENSION_DIR) -> str:
+    """Return a stable fingerprint for the unpacked extension source tree."""
+    digest = hashlib.sha256()
+    files = sorted(
+        (
+            path for path in extension_dir.rglob("*")
+            if path.is_file() and not path.name.endswith(".tmp")
+        ),
+        key=lambda path: path.relative_to(extension_dir).as_posix(),
+    )
+
+    for path in files:
+        relative = path.relative_to(extension_dir).as_posix()
+        if relative == "manifest.json":
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            manifest.pop("version_name", None)
+            content = json.dumps(
+                manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        else:
+            content = path.read_bytes()
+
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(content)
+        digest.update(b"\0")
+
+    return digest.hexdigest()[:12]
+
+
+def read_extension_release(manifest_path: Path = EXTENSION_MANIFEST_PATH) -> Dict[str, str]:
+    """Read the extension release identifier currently present on disk."""
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"version": "unknown", "versionName": "unknown"}
+
+    version = str(manifest.get("version") or "unknown")
+    return {
+        "version": version,
+        "versionName": str(manifest.get("version_name") or version),
+    }
+
+
+def prepare_extension_release(extension_dir: Path = EXTENSION_DIR) -> Dict[str, str]:
+    """Update Manifest version_name when unpacked extension files change."""
+    manifest_path = extension_dir / "manifest.json"
+    release = read_extension_release(manifest_path)
+    if release["version"] == "unknown":
+        return release
+
+    try:
+        fingerprint = calculate_extension_fingerprint(extension_dir)
+        version_name = f'{release["version"]}+local.{fingerprint}'
+        raw = manifest_path.read_text(encoding="utf-8")
+        manifest = json.loads(raw)
+        if manifest.get("version_name") == version_name:
+            return {"version": release["version"], "versionName": version_name}
+
+        version_name_pattern = re.compile(r'("version_name"\s*:\s*")[^"]*(")')
+        updated, replacements = version_name_pattern.subn(
+            rf'\g<1>{version_name}\g<2>',
+            raw,
+            count=1,
+        )
+        if replacements == 0:
+            manifest["version_name"] = version_name
+            newline = "\r\n" if "\r\n" in raw else "\n"
+            updated = json.dumps(manifest, ensure_ascii=False, indent=2) + newline
+
+        temp_path = manifest_path.with_name(manifest_path.name + ".tmp")
+        with temp_path.open("w", encoding="utf-8", newline="") as fh:
+            fh.write(updated)
+        temp_path.replace(manifest_path)
+        return {"version": release["version"], "versionName": version_name}
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"[ShadowWrite] Extension version check unavailable: {exc}")
+        return read_extension_release(manifest_path)
 
 # Pre-import tkinter so the browse-directory dialog opens faster.
 # If tkinter is unavailable (rare), we simply skip — the browse
@@ -88,17 +178,76 @@ def load_dotenv(path: Path) -> None:
 # Conversation state — in-memory per-session tracking
 # ---------------------------------------------------------------------------
 
+def content_digest(value: str) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
 class ConversationState:
     """Track per-conversation state for idempotent writes."""
 
-    def __init__(self):
+    def __init__(self, state_path: Path | None = None):
         self._lock = threading.Lock()
+        self._state_path = state_path
         # { conversationId: { messageId: {content, thinking, md_offset, html_offset, turn_id} } }
         self._written: Dict[str, Dict[str, Dict[str, Any]]] = {}
         # { conversationId: next_turn_id }
         self._turn_ids: Dict[str, int] = {}
         # { conversationId: { platform, title, output_path, html_path } }
         self._meta: Dict[str, Dict[str, Any]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self._state_path or not self._state_path.exists():
+            return
+        try:
+            data = json.loads(self._state_path.read_text(encoding="utf-8"))
+            written = data.get("written", {})
+            turn_ids = data.get("turnIds", {})
+            meta = data.get("meta", {})
+            if not all(isinstance(value, dict) for value in (written, turn_ids, meta)):
+                raise ValueError("state sections must be objects")
+            self._written = written
+            self._turn_ids = {
+                str(key): int(value) for key, value in turn_ids.items()
+            }
+            self._meta = meta
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            print(f"[ShadowWrite] Warning: cannot load state file: {exc}", file=sys.stderr)
+
+    def persist(self) -> bool:
+        if not self._state_path:
+            return True
+        try:
+            with self._lock:
+                persisted_written: Dict[str, Dict[str, Dict[str, Any]]] = {}
+                for conversation_id, records in self._written.items():
+                    persisted_written[conversation_id] = {}
+                    for message_id, record in records.items():
+                        persisted_written[conversation_id][message_id] = {
+                            "content_hash": record.get("content_hash")
+                            or content_digest(record.get("content", "")),
+                            "thinking_hash": record.get("thinking_hash")
+                            or content_digest(record.get("thinking", "")),
+                            "md_offset": int(record.get("md_offset", 0)),
+                            "html_offset": int(record.get("html_offset", 0)),
+                            "turn_id": int(record.get("turn_id", 0)),
+                        }
+                payload = {
+                    "version": 1,
+                    "written": persisted_written,
+                    "turnIds": self._turn_ids,
+                    "meta": self._meta,
+                }
+                self._state_path.parent.mkdir(parents=True, exist_ok=True)
+                temp_path = self._state_path.with_name(self._state_path.name + ".tmp")
+                temp_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    encoding="utf-8",
+                )
+                temp_path.replace(self._state_path)
+            return True
+        except OSError as exc:
+            print(f"[ShadowWrite] Warning: cannot persist state file: {exc}", file=sys.stderr)
+            return False
 
     def get_written(self, conversation_id: str, message_id: str) -> Dict[str, Any] | None:
         """Return stored write-record or None if not yet written."""
@@ -147,6 +296,24 @@ class ConversationState:
         with self._lock:
             self._written.pop(conversation_id, None)
             self._turn_ids.pop(conversation_id, None)
+
+    def truncate_from(self, conversation_id: str, md_offset: int, next_turn_id: int) -> None:
+        """Forget records at/after a file truncation point.
+
+        When a streamed or edited turn changes, the writer truncates the output
+        file before that turn and rewrites from there. Any later message records
+        must be removed too, otherwise the next snapshot would skip messages
+        that are no longer present in the file.
+        """
+        with self._lock:
+            records = self._written.get(conversation_id)
+            if records:
+                self._written[conversation_id] = {
+                    msg_id: record
+                    for msg_id, record in records.items()
+                    if int(record.get("md_offset", 0)) < md_offset
+                }
+            self._turn_ids[conversation_id] = next_turn_id
 
 
 # ---------------------------------------------------------------------------
@@ -368,10 +535,13 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         if path == "/api/health":
+            extension_release = read_extension_release()
             self._send_json(200, {
                 "status": "ok",
                 "service": "ShadowWrite",
-                "version": "0.1.0",
+                "version": APP_VERSION,
+                "extensionVersion": extension_release["version"],
+                "extensionVersionName": extension_release["versionName"],
             })
             return
 
@@ -562,52 +732,79 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "Conversation file not found"})
             return
 
-        # Read conversation content (truncate if huge)
+        ctx_path = md_path.parent / f"{md_path.stem}.context.md"
+
+        # Merge existing long-term context with recent conversation content.
         try:
             md_content = md_path.read_text(encoding="utf-8")
         except OSError as e:
             self._send_json(500, {"error": f"Cannot read file: {e}"})
             return
 
-        # Truncate to ~12000 chars to stay within typical context windows
-        max_chars = 12000
-        if len(md_content) > max_chars:
-            md_content = md_content[-max_chars:]
+        existing_context = ""
+        if ctx_path.exists():
+            try:
+                existing_context = ctx_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
+        if len(existing_context) > 6000:
+            existing_context = (
+                existing_context[:3000]
+                + "\n\n... existing context truncated ...\n\n"
+                + existing_context[-3000:]
+            )
+
+        conversation_budget = max(4000, 12000 - len(existing_context))
+        if len(md_content) > conversation_budget:
+            md_content = md_content[-conversation_budget:]
 
         # Resolve API config from environment
         provider = os.environ.get("SHADOWWRITE_PROVIDER", "openai_compat")
         if provider == "gemini":
-            api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY", "")
+            api_key = (
+                os.environ.get("SHADOWWRITE_API_KEY")
+                or os.environ.get("GEMINI_API_KEY")
+                or os.environ.get("GOOGLE_API_KEY", "")
+            )
             model = os.environ.get("SHADOWWRITE_MODEL", "gemini-2.0-flash")
-            base_url = os.environ.get("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
+            base_url = (
+                os.environ.get("SHADOWWRITE_BASE_URL")
+                or os.environ.get("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
+            )
         else:
             api_key = (
-                os.environ.get("OPENAI_API_KEY")
+                os.environ.get("SHADOWWRITE_API_KEY")
+                or os.environ.get("OPENAI_API_KEY")
                 or os.environ.get("DEEPSEEK_API_KEY", "")
             )
             model = os.environ.get("SHADOWWRITE_MODEL", "gpt-4o-mini")
             base_url = (
-                os.environ.get("OPENAI_BASE_URL")
+                os.environ.get("SHADOWWRITE_BASE_URL")
+                or os.environ.get("OPENAI_BASE_URL")
                 or os.environ.get("DEEPSEEK_BASE_URL", "")
                 or "https://api.openai.com/v1"
             )
 
         if not api_key:
             self._send_json(400, {
-                "error": "No API key configured. Set OPENAI_API_KEY / GEMINI_API_KEY in .env"
+                "error": "No API key configured. Set SHADOWWRITE_API_KEY or a provider-specific key in .env"
             })
             return
 
         summarize_prompt = (
-            "你是一个上下文摘要助手。下面是一段 AI 对话记录（Markdown 格式）。\\n"
-            "请提取其中所有重要的、需要长期记住的信息，生成一份结构化的上下文摘要。\\n\\n"
-            "要求：\\n"
-            "- 使用 Markdown 格式，按主题分节（## 标题）\\n"
-            "- 保留具体数值、名称、决策、设定等细节\\n"
-            "- 区分「已确定」和「待定/讨论中」的信息\\n"
-            "- 简洁但不遗漏关键信息\\n"
-            "- 只输出摘要内容，不要输出任何解释\\n\\n"
-            "对话记录：\\n"
+            "你是一个上下文摘要助手。请把已有长期上下文与近期 AI 对话合并，\n"
+            "生成一份完整的、可直接替换旧文件的结构化上下文摘要。\n\n"
+            "要求：\n"
+            "- 使用 Markdown 格式，按主题分节（## 标题）\n"
+            "- 保留具体数值、名称、决策、设定等细节\n"
+            "- 区分「已确定」和「待定/讨论中」的信息\n"
+            "- 保留已有上下文中仍有效、但近期对话没有重复提及的信息\n"
+            "- 若近期对话明确修正旧信息，以新信息为准，不保留冲突版本\n"
+            "- 简洁但不遗漏关键信息\n"
+            "- 只输出摘要内容，不要输出任何解释\n\n"
+            "已有长期上下文：\n"
+            f"{existing_context or '(空)'}\n\n"
+            "近期对话记录：\n"
             f"{md_content}"
         )
 
@@ -622,11 +819,10 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
             return
 
         # Write context file
-        ctx_path = md_path.parent / f"{md_path.stem}.context.md"
         ctx_path.parent.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        header = f"<!-- Auto-summarized by ShadowWrite at {ts} -->\\n\\n"
-        ctx_path.write_text(header + summary.strip() + "\\n", encoding="utf-8")
+        header = f"<!-- Auto-summarized by ShadowWrite at {ts} -->\n\n"
+        ctx_path.write_text(header + summary.strip() + "\n", encoding="utf-8")
 
         self.log_message("  [context/summarize] Generated %d chars for %s", len(summary), ctx_path.name)
         self._send_json(200, {
@@ -869,6 +1065,23 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
             self.log_message("  [move] Failed: %s", e)
             return (None, None)
 
+    def _backup_untracked_outputs(self, md_path: Path, html_path: Path) -> bool:
+        """Preserve pre-state files before rebuilding them from a full snapshot."""
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        try:
+            for path in (md_path, html_path):
+                if not path.exists():
+                    continue
+                backup = path.with_name(
+                    f"{path.stem}.pre-state-backup-{stamp}{path.suffix}"
+                )
+                path.replace(backup)
+                self.log_message("  [state] Preserved legacy output: %s", backup.name)
+            return True
+        except OSError as exc:
+            self.log_message("  [state] Failed to preserve legacy output: %s", exc)
+            return False
+
     def _handle_config_update(self):
         """Update server configuration at runtime."""
         content_length = int(self.headers.get("Content-Length", 0))
@@ -953,6 +1166,7 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
                     self.state.set_meta(conversation_id, meta)
 
         self.log_message("  [config] conv %s \u2192 outputDir: %s", conversation_id[:16], effective_dir)
+        self.state.persist()
         self._send_json(200, {
             "status": "ok",
             "conversationId": conversation_id,
@@ -1020,6 +1234,10 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
             else:
                 md_path = base_dir / dir_name / sub_name / f"{display_name}.md"
                 html_path = base_dir / dir_name / sub_name / f"{display_name}.chat.html"
+
+            if md_path.exists() and not self._backup_untracked_outputs(md_path, html_path):
+                self._send_json(500, {"error": "Cannot preserve existing output before state migration"})
+                return
 
             ensure_output_file(md_path, platform, title)
             if self.chat_html:
@@ -1109,7 +1327,17 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
 
             if prev is not None:
                 # Already written — check whether content changed (streaming update)
-                if prev["content"] == content and prev["thinking"] == thinking:
+                same_content = (
+                    prev.get("content") == content
+                    if "content" in prev
+                    else prev.get("content_hash") == content_digest(content)
+                )
+                same_thinking = (
+                    prev.get("thinking") == thinking
+                    if "thinking" in prev
+                    else prev.get("thinking_hash") == content_digest(thinking)
+                )
+                if same_content and same_thinking:
                     skipped_count += 1
                     continue
                 # Content changed: truncate files back to the saved offset and rewrite
@@ -1117,6 +1345,11 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
                 truncate_file(md_path, prev["md_offset"])
                 if self.chat_html:
                     truncate_file(html_path, prev["html_offset"])
+                self.state.truncate_from(
+                    conversation_id,
+                    prev["md_offset"],
+                    turn_id + 1,
+                )
                 updated_count += 1
             else:
                 turn_id = self.state.next_turn_id(conversation_id)
@@ -1145,6 +1378,7 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
                 conversation_id[:16], len(content),
             )
 
+        self.state.persist()
         self._send_json(200, {
             "status": "ok",
             "written": written_count,
@@ -1206,15 +1440,21 @@ def main() -> int:
         load_dotenv(env_path)
 
     args = parse_args()
+    extension_release = prepare_extension_release()
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    state = ConversationState()
+    state = ConversationState(output_dir / ".shadowwrite-state.json")
     chat_html = not args.no_html
     handler_class = create_handler_class(state, output_dir, chat_html)
 
-    server = HTTPServer((args.host, args.port), handler_class)
+    try:
+        server = HTTPServer((args.host, args.port), handler_class)
+    except OSError as exc:
+        print(f"[ShadowWrite] Could not start http://{args.host}:{args.port}: {exc}")
+        print("Close the existing server or choose another --port, then try again.")
+        return 1
 
     # Graceful shutdown — must call server.shutdown() from a *different* thread.
     # Calling it directly in the signal handler (main thread) deadlocks because
@@ -1233,6 +1473,7 @@ def main() -> int:
 ║  Listening:   http://{args.host}:{args.port}               ║
 ║  Output dir:  {str(output_dir):<45s}║
 ║  Chat HTML:   {'ON' if chat_html else 'OFF':<45s}║
+║  Extension:   {extension_release['versionName']:<45s}║
 ║  Health:      GET  /api/health                               ║
 ║  Messages:    POST /api/messages                             ║
 ║                                                              ║

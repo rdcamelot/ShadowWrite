@@ -6,10 +6,10 @@
 
 ## 特性
 
-- **双路线并行**：CLI 终端对话（API 直连）+ Chrome 扩展（7 大 AI 平台网页端）
+- **双路线并行**：CLI 终端对话（API 直连）+ Chrome 扩展（8 大 AI 平台网页端）
 - **实时流式写入**：对话即文件，每句话实时追加到本地 `.md` + `.chat.html`
 - **零依赖**：纯 Python stdlib，无需 `pip install`
-- **上下文记忆**：`context.md` 持久化关键设定，跨会话不丢失
+- **CLI 上下文记忆**：Context File 持久化关键设定，跨上下文窗口保留；复用同一文件时可跨会话使用
 - **隐私优先**：所有数据纯本地处理，不经过任何第三方服务器
 
 ## 两种使用方式
@@ -20,7 +20,7 @@
 | **模型** | OpenAI-compatible / Gemini API | 网页端免费模型 |
 | **费用** | API Token 计费 | 免费 |
 | **输出** | `.md` + `.chat.html` | `.md` + `.chat.html` |
-| **上下文记忆** | ✅ Context File | — |
+| **上下文记忆** | ✅ Context File | 默认关闭，扩展入口当前隐藏 |
 | **适用场景** | 深度写作、项目开发 | 日常对话备份 |
 
 ---
@@ -55,7 +55,11 @@ VS Code 推荐布局：左侧终端对话，右侧打开 `outputs/xxx/xxx.md` �
 
 **第一步：启动本地 HTTP 服务**
 
-```bash
+Windows 可直接双击项目根目录的 `run.bat`，也可以在终端启动：
+
+```powershell
+run.bat
+# 或
 python shadowwrite_server.py
 # 看到 "ShadowWrite Local Server" 横幅即成功
 ```
@@ -64,6 +68,8 @@ python shadowwrite_server.py
 
 1. 打开 `chrome://extensions`，开启**开发者模式**
 2. 点击**"加载已解压的扩展程序"**，选择 `extension/` 目录
+
+> **本地扩展自动更新**：服务启动时会为 `extension/` 计算代码版本；Chrome 中的 ShadowWrite 每分钟检查一次。发现本地代码变化后，扩展会自动重载并刷新已经打开的 AI 页面。本次加入该功能后需先在 `chrome://extensions` 手动点击一次 ShadowWrite 的“重新加载”，之后才会自动检查。Chrome 未运行时不会被 `run.bat` 强制打开，下次启动 Chrome 后会继续检查。
 
 **第三步：开始追踪**
 
@@ -85,6 +91,10 @@ python shadowwrite_server.py
 
 > **按对话指定输出目录**：在 AI 会话页面打开弹窗，"输出目录"一栏变为"**输出目录 (当前对话)**"，可单独为这个对话指定保存路径（例如直接保存到相关项目目录中）。修改后底部会显示全局默认路径，点击 ↩ 按钮可随时重置回全局。修改目录时，服务器会自动将该对话已有的文件整体迁移到新路径。
 
+> **上下文记忆（扩展）**：当前默认关闭并隐藏入口，不会注入或更新对话级 `.context.md`。CLI 的 Context File 功能不受影响。
+
+> **网页剪藏（实验）**：在普通网页右键选择“剪藏到 ShadowWrite”，或打开扩展把“当前网页连续剪藏”打开。首次会立即保存正文，开启“页面变化时自动剪藏”后，章节/页面 URL 变化会继续写入 `outputs/clips/`。正文提取优先使用已知站点选择器，再降级到选区、`article/main` 和段落评分。
+
 **第四步：查看输出**
 
 ```
@@ -99,6 +109,16 @@ outputs/
 > ```powershell
 > curl.exe http://127.0.0.1:24601/api/health
 > ```
+
+开发回归测试：
+
+```powershell
+node tests\adapter_dom_smoke.js
+node tests\service_worker_update_smoke.js
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+DOM 冒烟测试会自动调用本机 Chrome/Edge，覆盖各平台主选择器、语义角色 fallback、增量更新和发送重试。它不能替代已登录网站的扩展端到端测试；平台更新后仍应重载扩展，并在真实会话中确认终端收到 `POST /api/messages`。
 
 ---
 
@@ -213,7 +233,7 @@ python shadowwrite_cli.py --no-record --context-file auto
 
 ### Chrome 扩展 (`extension/`)
 
-- Manifest V3，7 平台 content scripts
+- Manifest V3，8 平台 content scripts
 - `BaseShadowWriteAdapter` 基类 + 平台子类
 - `MutationObserver` + 1s debounce / 3s throttle 实时监听（串流期间最多 3s 延迟）
 - JSON 快照差异比较 + 流式 upsert（内容变化时截断文件重写，不产生重复）
@@ -247,7 +267,11 @@ python shadowwrite_cli.py --no-record --context-file auto
 - `GET  /api/config` — 读取运行时配置；附 `?conversationId=` 可获取该对话的实际输出目录及是否使用自定义路径
 - `POST /api/config` — 热更新配置：不传 `conversationId` 时修改全局目录/Chat HTML；传入 `conversationId` 时设置对话级自定义目录，服务器自动迁移已有文件（`outputDir: null` 重置回全局）
 - `POST /api/browse-directory` — 在服务器端弹出原生目录选择对话框，返回所选路径
+- `POST /api/clip` — 创建网页剪藏；相同站点和标题再次提交时追加内容
+- `GET/POST /api/context` — 读取或更新当前对话的 `.context.md`
+- `POST /api/context/summarize` — 用已配置模型合并已有 context 与近期对话，生成完整替代摘要
 - 线程安全，`messageId` 幂等去重，CORS 支持
+- 在输出根目录用 `.shadowwrite-state.json` 原子保存消息哈希和文件偏移，服务重启后不会重复追加；首次迁移旧输出时会保留 `pre-state-backup` 备份
 - 对话标题变更时自动重命名本地文件及目录
 - 输出结构：`{output_dir}/{platform}/{标题}/`
 
@@ -278,6 +302,7 @@ SHADOWWRITE_SERVER_CHAT_HTML=true   # false 则不生成 .chat.html
 
 ```
 ShadowWrite/
+├── run.bat                     ← Windows 双击启动本地服务
 ├── shadowwrite_cli.py          ← CLI 主程序
 ├── shadowwrite_server.py       ← 本地 HTTP 服务
 ├── .env.example                ← 配置模板
@@ -301,8 +326,9 @@ ShadowWrite/
 
 - **懒加载**：部分平台（如 Gemini）对长对话使用虚拟滚动，扩展只能抓取当前 DOM 中已加载的消息。建议开启追踪前先手动滚动到对话顶部。
 - **Gemini Deep Research**：Deep Research 模式生成的报告使用独立渲染组件，当前不支持抓取。
-- **服务须手动启动**：需在终端手动运行 `python shadowwrite_server.py`。
+- **服务需要单独运行**：Windows 可双击 `run.bat`；其他系统仍需运行 `python shadowwrite_server.py`。
 - **CSS 选择器耦合**：平台前端更新可能导致适配器失效，需更新选择器。
+- **网页剪藏为启发式提取**：未知站点可能混入导航栏等噪声，连续剪藏前建议先检查首次输出。
 
 ## Roadmap
 

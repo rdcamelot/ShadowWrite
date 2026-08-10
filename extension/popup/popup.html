@@ -206,11 +206,11 @@
   <div class="sec">
     <div class="sec-l">捕获</div>
     <div class="tg">
-      <span>当前对话追踪</span>
+      <span id="trackingLabel">当前对话追踪</span>
       <label class="sw"><input type="checkbox" id="trackingToggle"><span class="sl"></span></label>
     </div>
     <div class="tg">
-      <span>自动追踪新对话</span>
+      <span id="autoCaptureLabel">自动追踪新对话</span>
       <label class="sw"><input type="checkbox" id="autoCapture" checked><span class="sl"></span></label>
     </div>
   </div>
@@ -254,24 +254,24 @@
     </div>
   </div>
 
-  <div class="d"></div>
+  <div class="d" style="display:none"></div>
 
   <!-- Context -->
-  <div class="sec" id="contextSection">
-    <div class="sec-l">上下文记忆</div>
+  <div class="sec" id="contextSection" style="display:none">
+    <div class="sec-l">当前对话上下文记忆</div>
     <div class="tg">
       <span>模式</span>
       <select class="sel" id="contextMode">
         <option value="off">关闭</option>
-        <option value="inject">注入 (方案二)</option>
-        <option value="auto-summary">自动摘要 (方案四)</option>
+        <option value="inject">发送时自动注入</option>
+        <option value="auto-summary">API 摘要（手动）</option>
       </select>
     </div>
     <div class="hint" style="margin-top:4px">
-      注入：AI 回复中的 context-update 标记自动保存到本地<br>
-      摘要：用 API 自动总结对话为上下文文件
+      注入：仅 ChatGPT / Gemini / Grok，发送时附加当前对话的 .context.md<br>
+      两种模式都会保存 AI 的 context-update 标记；API 摘要按钮会重写摘要文件
     </div>
-    <button class="act-btn" id="injectCtxBtn" style="display:none">📋 注入上下文到输入框</button>
+    <button class="act-btn" id="injectCtxBtn" style="display:none">📋 预览/编辑本次注入</button>
     <button class="act-btn" id="summarizeBtn" style="display:none">🤖 生成/更新摘要</button>
   </div>
 

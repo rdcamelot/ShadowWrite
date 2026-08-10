@@ -34,7 +34,7 @@ function bg(msg) {
 }
 
 function isSupportedAiPage(url = "") {
-  return /^https:\/\/(?:chatgpt\.com|chat\.openai\.com|chat\.deepseek\.com|gemini\.google\.com|claude\.ai|grok\.com|kimi\.moonshot\.cn|[^/]+\.kimi\.com|www\.doubao\.com|yuanbao\.tencent\.com)\//.test(url);
+  return /^https:\/\/(?:chatgpt\.com|chat\.openai\.com|chat\.deepseek\.com|gemini\.google\.com|claude\.ai|grok\.com|kimi\.moonshot\.cn|kimi\.com|[^/]+\.kimi\.com|www\.doubao\.com|yuanbao\.tencent\.com)\//.test(url);
 }
 
 function tabMessage(tabId, message) {
@@ -76,17 +76,31 @@ async function loadSettings() {
   $("autoCapture").checked = local.autoCapture;
   $("host").value = local.host;
   $("port").value = local.port;
-  $("contextMode").value = local.contextMode || "off";
-  updateContextButtons(local.contextMode || "off");
+  $("contextMode").value = "off";
+  updateContextButtons("off");
+  if (local.contextMode !== "off") {
+    await chrome.storage.sync.set({ contextMode: "off" });
+  }
 
   // 2. Query active tab for tracking state + conversationId
   await loadTrackingState();
+  updateCaptureModeUi();
 
   // 3. Server config (outputDir, chatHtml)
   await loadServerConfig();
   if (activeScriptUnavailable) {
     setStatus("Refresh the AI page to load ShadowWrite.", "err");
   }
+}
+
+function updateCaptureModeUi() {
+  $("trackingLabel").textContent = isClipMode
+    ? "当前网页连续剪藏"
+    : "当前对话追踪";
+  $("autoCaptureLabel").textContent = isClipMode
+    ? "页面变化时自动剪藏"
+    : "自动追踪新对话";
+  $("contextSection").style.display = "none";
 }
 
 /**
@@ -267,9 +281,11 @@ function attachListeners() {
         } else if (!enabled) {
           setStatus("✓ 已停止追踪", "ok");
         } else {
+          $("trackingToggle").checked = false;
           setStatus("✗ 剪藏失败: " + (res?.error || ""), "err");
         }
       } catch {
+        $("trackingToggle").checked = false;
         setStatus("✗ 无法连接本地服务", "err");
       }
       return;
@@ -349,7 +365,8 @@ function attachListeners() {
 
   // ── Context mode ────────────────────────────────────────────
   $("contextMode").addEventListener("change", async () => {
-    const mode = $("contextMode").value;
+    const mode = "off";
+    $("contextMode").value = mode;
     await chrome.storage.sync.set({ contextMode: mode });
 
     // Tell active content script
@@ -412,7 +429,7 @@ function broadcastLocal() {
       host: $("host").value.trim() || "127.0.0.1",
       port: parseInt($("port").value, 10) || 24601,
       autoCapture: $("autoCapture").checked,
-      contextMode: $("contextMode").value || "off",
+      contextMode: "off",
     },
   });
 }

@@ -35,6 +35,12 @@
       };
     }
 
+    getUrlKey(url) {
+      const parsed = new URL(url, location.origin);
+      const rid = parsed.searchParams.get("rid");
+      return `${parsed.origin}${parsed.pathname}${rid ? `?rid=${encodeURIComponent(rid)}` : ""}`;
+    }
+
     extractTitle() {
       if (this._cachedTitle) return this._cachedTitle;
       const title = document.title
@@ -52,13 +58,13 @@
       if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
       return (
         node.matches?.(
-          ".action-buttons, .thinking-container, .search-results, .inline-media-container, .prose, textarea, [contenteditable=\"true\"]"
+          "article, [data-testid*=\"message\"], .action-buttons, .thinking-container, .search-results, .inline-media-container, .prose, textarea, [contenteditable=\"true\"]"
         ) ||
         node.querySelector?.(
-          ".action-buttons, .thinking-container, .search-results, .inline-media-container, .prose, textarea, [contenteditable=\"true\"]"
+          "article, [data-testid*=\"message\"], .action-buttons, .thinking-container, .search-results, .inline-media-container, .prose, textarea, [contenteditable=\"true\"]"
         ) !== null ||
         node.closest?.(
-          ".action-buttons, .thinking-container, .search-results, .inline-media-container, .prose"
+          "article, [data-testid*=\"message\"], .action-buttons, .thinking-container, .search-results, .inline-media-container, .prose"
         ) !== null
       );
     }
@@ -74,9 +80,6 @@
 
     async _checkForChanges() {
       if (!this.currentConversationId) return;
-      if (document.querySelector("textarea:focus, [contenteditable]:focus")) {
-        return;
-      }
 
       const epoch = this._epoch;
       try {
@@ -85,9 +88,10 @@
         const messages = snapshot.messages || [];
         if (messages.length === 0) return;
 
-        const json = JSON.stringify(messages);
-        if (json !== this.lastMessagesJson) {
-          this.lastMessagesJson = json;
+        const signature = this._buildSnapshotSignature(messages);
+        if (signature !== this.lastMessagesSignature) {
+          this.lastMessagesSignature = signature;
+          this._cancelInitialCapture();
           await this._sendToService(messages);
         }
       } catch (err) {
@@ -97,7 +101,7 @@
 
     async _captureAndSend(retries = 0, epoch) {
       if (epoch === undefined) epoch = this._epoch;
-      if (epoch !== this._epoch) return;
+      if (!this.isTracking || epoch !== this._epoch) return;
 
       try {
         const snapshot = await this._getSnapshot(true);
@@ -117,7 +121,7 @@
           return;
         }
 
-        this.lastMessagesJson = JSON.stringify(messages);
+        this.lastMessagesSignature = this._buildSnapshotSignature(messages);
         await this._sendToService(messages);
       } catch (err) {
         console.warn("[ShadowWrite] Grok initial capture failed:", err);
@@ -184,15 +188,86 @@
     }
 
     async _fetchSnapshot(nativeConversationId) {
-      const [conversationData, responsesData] = await Promise.all([
-        this._fetchJson(`/rest/app-chat/conversations_v2/${encodeURIComponent(nativeConversationId)}`),
-        this._fetchJson(`/rest/app-chat/conversations/${encodeURIComponent(nativeConversationId)}/responses`),
+      const encodedId = encodeURIComponent(nativeConversationId);
+      const [conversationResult, responsesResult] = await Promise.allSettled([
+        this._fetchJson(`/rest/app-chat/conversations_v2/${encodedId}`),
+        this._fetchJson(`/rest/app-chat/conversations/${encodedId}/responses`),
       ]);
+
+      const conversationData = conversationResult.status === "fulfilled"
+        ? conversationResult.value
+        : null;
+      if (conversationResult.status === "rejected") {
+        console.debug?.("[ShadowWrite] Grok title endpoint failed:", conversationResult.reason);
+      }
+
+      const apiMessages = responsesResult.status === "fulfilled"
+        ? this._buildMessagesFromResponses(responsesResult.value)
+        : [];
+      const messages = apiMessages.length > 0
+        ? apiMessages
+        : this._extractMessagesFromDom();
+
+      if (messages.length === 0 && responsesResult.status === "rejected") {
+        throw responsesResult.reason;
+      }
 
       return {
         title: conversationData?.conversation?.title?.trim() || this.extractTitle(),
-        messages: this._buildMessagesFromResponses(responsesData),
+        messages,
       };
+    }
+
+    _extractMessagesFromDom() {
+      const selector = [
+        '[data-message-author-role="user"]',
+        '[data-message-author-role="assistant"]',
+        '[data-testid="user-message"]',
+        '[data-testid="human-message"]',
+        '[data-testid="assistant-message"]',
+        '[data-testid="model-message"]',
+        '[data-role="user"]',
+        '[data-role="assistant"]',
+      ].join(", ");
+      const elements = Array.from(document.querySelectorAll(selector))
+        .filter((element) => !element.parentElement?.closest(selector));
+
+      return elements.map((element, index) => {
+        const marker = [
+          element.getAttribute("data-message-author-role"),
+          element.getAttribute("data-testid"),
+          element.getAttribute("data-role"),
+        ].filter(Boolean).join(" ").toLowerCase();
+        const sender = /user|human/.test(marker) ? "user" : "AI";
+        const thinkingElement = element.querySelector(
+          '.thinking-container, [data-testid="thinking-content"]'
+        );
+        const thinking = thinkingElement
+          ? this.extractFormattedContent(thinkingElement).trim()
+          : "";
+        const clone = element.cloneNode(true);
+        clone.querySelectorAll(
+          'button, [role="toolbar"], .action-buttons, .thinking-container, [data-testid="thinking-content"]'
+        ).forEach((node) => node.remove());
+        const contentElement = clone.querySelector(
+          '.prose, .markdown, [data-testid="message-content"]'
+        ) || clone;
+        const extracted = this.extractFormattedContent(contentElement).trim();
+        const content = sender === "user"
+          ? this._stripInjectedContextPrefix(extracted)
+          : extracted;
+        if (!content && !thinking) return null;
+
+        return {
+          messageId: element.id
+            ? `dom_${element.id}`
+            : this.generateMessageId(sender, index),
+          sender,
+          content,
+          thinking,
+          position: index,
+        };
+      }).filter(Boolean);
     }
 
     async _fetchJson(path) {
@@ -252,7 +327,10 @@
       if (!response) return null;
 
       const sender = response.sender === "human" ? "user" : "AI";
-      const content = this._buildContent(response).trim();
+      const extracted = this._buildContent(response).trim();
+      const content = sender === "user"
+        ? this._stripInjectedContextPrefix(extracted)
+        : extracted;
       const thinking = this._normalizeThinking(response.thinkingTrace).trim();
 
       if (!content && !thinking) return null;

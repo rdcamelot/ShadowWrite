@@ -23,6 +23,7 @@
   const DEBOUNCE_DELAY = 1000;            // ms after last DOM change
   const THROTTLE_INTERVAL = 3000;         // max wait during continuous DOM changes
   const URL_POLL_INTERVAL = 1000;         // ms between URL polls
+  const SEND_RETRY_DELAY = 5000;          // retry failed local-server sends
   const DEFAULT_HOST = "127.0.0.1";
   const DEFAULT_PORT = 24601;
   const CONTEXT_INVALIDATED_MSG = "Extension context invalidated";
@@ -41,16 +42,27 @@
 
       // State
       this.currentConversationId = null;
-      this.lastMessagesJson = "";          // serialised snapshot for diff
-      this.lastKnownUrl = location.href.split("?")[0];
+      this.lastMessagesSignature = "";     // compact snapshot signature for diff
+      this.lastKnownUrl = this.getUrlKey(location.href);
       this.isTracking = false;             // per-conversation tracking toggle
       this._epoch = 0;                     // incremented on URL change; stale timers check this
 
       // Observers / timers
       this.contentObserver = null;
+      this.observerRoot = null;
+      this.observerRetryTimer = null;
       this.debounceTimer = null;
       this.throttleTimer = null;           // max-wait during streaming
       this.urlCheckInterval = null;
+      this.initialCaptureHandle = null;
+      this.initialCaptureUsesIdle = false;
+      this.captureIdleHandle = null;
+      this.captureIdleUsesIdle = false;
+      this.sendInFlight = false;
+      this.queuedSnapshot = null;
+      this.failedSnapshot = null;
+      this.sendRetryTimer = null;
+      this._formatCache = new WeakMap();
 
       // Settings (loaded from chrome.storage.sync)
       this.settings = {
@@ -67,6 +79,9 @@
       this._contextContent = "";         // cached context file content
       this._submitHooked = false;        // whether hidden inject is active
       this._origSubmitHandler = null;    // ref for cleanup
+      this._origSubmitClickHandler = null;
+      this._contextSubmitInFlight = false;
+      this._bypassContextInject = false;
     }
 
     /* ==============================================================
@@ -148,6 +163,22 @@
       return document.title || null;
     }
 
+    /**
+     * Return the smallest stable DOM subtree that contains chat messages.
+     * Subclasses can narrow this further (for example Gemini's #chat-history).
+     */
+    getObserverRoot() {
+      return document.querySelector("main") || document.body;
+    }
+
+    /**
+     * Return the URL identity used by the SPA watcher. Most platforms keep
+     * conversation identity in the path and can ignore query parameters.
+     */
+    getUrlKey(url) {
+      return String(url).split("?")[0];
+    }
+
     /* ==============================================================
      *  Lifecycle
      * ============================================================== */
@@ -200,7 +231,11 @@
           contextMode: "off",
         });
         Object.assign(this.settings, result);
-        this._contextMode = result.contextMode || "off";
+        this.settings.contextMode = "off";
+        this._contextMode = "off";
+        if (result.contextMode !== "off") {
+          await chrome.storage.sync.set({ contextMode: "off" });
+        }
       } catch {
         // Defaults already set
       }
@@ -248,7 +283,7 @@
 
       if (this.isTracking) {
         console.log(`[ShadowWrite] Tracking ON for ${this.currentConversationId}`);
-        this._captureAndSend();
+        this._scheduleInitialCapture();
         this._setupMutationObserver();
       } else {
         console.log(`[ShadowWrite] Tracking OFF for ${this.currentConversationId} — click dot to enable`);
@@ -279,13 +314,13 @@
 
       this.isTracking = true;
       // Clear snapshot cache so _captureAndSend always sends a fresh snapshot
-      this.lastMessagesJson = "";
+      this.lastMessagesSignature = "";
       window.dispatchEvent(new CustomEvent("shadowwrite-tracking-state", {
         detail: { tracking: true, hasConversation: true, conversationId: this.currentConversationId },
       }));
 
       // Start capturing
-      this._captureAndSend();
+      this._scheduleInitialCapture();
       this._setupMutationObserver();
 
       // Setup hidden context inject if mode is "inject"
@@ -322,6 +357,15 @@
         this.contentObserver.disconnect();
         this.contentObserver = null;
       }
+      this.observerRoot = null;
+      this.queuedSnapshot = null;
+      this._clearSendRetry();
+      if (this.observerRetryTimer) {
+        clearTimeout(this.observerRetryTimer);
+        this.observerRetryTimer = null;
+      }
+      this._cancelInitialCapture();
+      this._cancelPendingChangeCheck();
       this._teardownHiddenInject();
     }
 
@@ -339,6 +383,17 @@
       if (this.contentObserver) {
         this.contentObserver.disconnect();
       }
+      if (this.observerRetryTimer) {
+        clearTimeout(this.observerRetryTimer);
+        this.observerRetryTimer = null;
+      }
+
+      const root = this.getObserverRoot();
+      if (!root) {
+        this._scheduleObserverRetry();
+        return;
+      }
+      this.observerRoot = root;
 
       this.contentObserver = new MutationObserver((mutations) => {
         // autoCapture controls whether new conversations are enabled
@@ -347,6 +402,8 @@
 
         let hasRelevant = false;
         for (const mutation of mutations) {
+          this._invalidateFormatCacheForMutation(mutation);
+
           if (mutation.type === "childList") {
             for (const node of mutation.addedNodes) {
               const candidate = node.nodeType === Node.ELEMENT_NODE
@@ -367,6 +424,11 @@
               }
               el = el.parentElement;
             }
+          } else if (
+            mutation.type === "attributes" &&
+            this.isMessageElement(mutation.target)
+          ) {
+            hasRelevant = true;
           }
           if (hasRelevant) break;
         }
@@ -376,11 +438,68 @@
         }
       });
 
-      this.contentObserver.observe(document.body, {
+      this.contentObserver.observe(root, {
         childList: true,
         subtree: true,
         characterData: true,
+        attributes: true,
+        attributeFilter: ["href", "src", "alt"],
       });
+    }
+
+    _invalidateFormatCacheForMutation(mutation) {
+      let element = mutation.target?.nodeType === Node.ELEMENT_NODE
+        ? mutation.target
+        : mutation.target?.parentElement;
+
+      while (element) {
+        this._formatCache.delete(element);
+        if (element === this.observerRoot) break;
+        element = element.parentElement;
+      }
+    }
+
+    _scheduleObserverRetry() {
+      if (!this.isTracking || this.observerRetryTimer) return;
+      const epoch = this._epoch;
+      this.observerRetryTimer = setTimeout(() => {
+        this.observerRetryTimer = null;
+        if (this.isTracking && epoch === this._epoch) {
+          this._setupMutationObserver();
+        }
+      }, 1000);
+    }
+
+    _scheduleInitialCapture() {
+      this._cancelInitialCapture();
+      const epoch = this._epoch;
+      const run = () => {
+        this.initialCaptureHandle = null;
+        if (this.isTracking && epoch === this._epoch) {
+          this._captureAndSend(0, epoch);
+        }
+      };
+
+      if (typeof window.requestIdleCallback === "function") {
+        this.initialCaptureUsesIdle = true;
+        this.initialCaptureHandle = window.requestIdleCallback(run, { timeout: 2500 });
+      } else {
+        this.initialCaptureUsesIdle = false;
+        this.initialCaptureHandle = setTimeout(run, 500);
+      }
+    }
+
+    _cancelInitialCapture() {
+      if (this.initialCaptureHandle === null) return;
+      if (
+        this.initialCaptureUsesIdle &&
+        typeof window.cancelIdleCallback === "function"
+      ) {
+        window.cancelIdleCallback(this.initialCaptureHandle);
+      } else {
+        clearTimeout(this.initialCaptureHandle);
+      }
+      this.initialCaptureHandle = null;
     }
 
     _debouncedCapture() {
@@ -404,7 +523,39 @@
       if (epoch !== undefined && epoch !== this._epoch) return;
       if (this.debounceTimer)  { clearTimeout(this.debounceTimer);  this.debounceTimer  = null; }
       if (this.throttleTimer) { clearTimeout(this.throttleTimer); this.throttleTimer = null; }
-      this._checkForChanges();
+      this._scheduleChangeCheck(epoch);
+    }
+
+    _scheduleChangeCheck(epoch) {
+      if (this.captureIdleHandle !== null) return;
+
+      const run = () => {
+        this.captureIdleHandle = null;
+        if (!this.isTracking) return;
+        if (epoch !== undefined && epoch !== this._epoch) return;
+        this._checkForChanges();
+      };
+
+      if (typeof window.requestIdleCallback === "function") {
+        this.captureIdleUsesIdle = true;
+        this.captureIdleHandle = window.requestIdleCallback(run, { timeout: 1200 });
+      } else {
+        this.captureIdleUsesIdle = false;
+        this.captureIdleHandle = setTimeout(run, 0);
+      }
+    }
+
+    _cancelPendingChangeCheck() {
+      if (this.captureIdleHandle === null) return;
+      if (
+        this.captureIdleUsesIdle &&
+        typeof window.cancelIdleCallback === "function"
+      ) {
+        window.cancelIdleCallback(this.captureIdleHandle);
+      } else {
+        clearTimeout(this.captureIdleHandle);
+      }
+      this.captureIdleHandle = null;
     }
 
     /**
@@ -413,16 +564,18 @@
     _checkForChanges() {
       if (!this.currentConversationId) return;
 
-      // Skip if user is editing a message
-      if (document.querySelector("textarea:focus")) return;
+      // Skip only when an existing message is being edited. The composer often
+      // stays focused while the model streams, and must not block syncing.
+      if (this.isEditingMessage()) return;
 
       const messages = this.extractMessages();
       if (messages.length === 0) return; // nothing to send
 
-      const json = JSON.stringify(messages);
+      const signature = this._buildSnapshotSignature(messages);
 
-      if (json !== this.lastMessagesJson) {
-        this.lastMessagesJson = json;
+      if (signature !== this.lastMessagesSignature) {
+        this.lastMessagesSignature = signature;
+        this._cancelInitialCapture();
         this._sendToService(messages);
       }
     }
@@ -435,7 +588,7 @@
       // Capture epoch on first call so retries are bound to this conversation
       if (epoch === undefined) epoch = this._epoch;
       // Stale retry from a previous conversation — discard
-      if (epoch !== this._epoch) return;
+      if (!this.isTracking || epoch !== this._epoch) return;
 
       const messages = this.extractMessages();
       if (messages.length === 0) {
@@ -450,7 +603,7 @@
         }
         return;
       }
-      this.lastMessagesJson = JSON.stringify(messages);
+      this.lastMessagesSignature = this._buildSnapshotSignature(messages);
       this._sendToService(messages);
     }
 
@@ -462,14 +615,32 @@
       if (this.urlCheckInterval) clearInterval(this.urlCheckInterval);
 
       this.urlCheckInterval = setInterval(() => {
-        const current = location.href.split("?")[0];
+        const current = this.getUrlKey(location.href);
         if (current !== this.lastKnownUrl) {
           const oldUrl = this.lastKnownUrl;
           this.lastKnownUrl = current;
           console.log(`[ShadowWrite] URL changed: ${oldUrl} → ${current}`);
           this._handleUrlChange();
+        } else {
+          this._refreshObserverRootIfNeeded();
         }
       }, URL_POLL_INTERVAL);
+    }
+
+    _refreshObserverRootIfNeeded() {
+      if (!this.isTracking || !this.contentObserver) return;
+
+      const preferredRoot = this.getObserverRoot();
+      if (!preferredRoot) {
+        if (!this.observerRoot || !this.observerRoot.isConnected) {
+          this._setupMutationObserver();
+        }
+        return;
+      }
+
+      if (preferredRoot !== this.observerRoot || !this.observerRoot?.isConnected) {
+        this._setupMutationObserver();
+      }
     }
 
     _handleUrlChange() {
@@ -477,15 +648,23 @@
       this._epoch++;
 
       // Reset state
-      this.lastMessagesJson = "";
+      this.lastMessagesSignature = "";
+      this._formatCache = new WeakMap();
+      this._contextContent = "";
       this.isTracking = false;
       if (this.contentObserver) {
         this.contentObserver.disconnect();
         this.contentObserver = null;
       }
+      this.observerRoot = null;
       // Clear pending capture timers
       if (this.debounceTimer)  { clearTimeout(this.debounceTimer);  this.debounceTimer  = null; }
       if (this.throttleTimer) { clearTimeout(this.throttleTimer); this.throttleTimer = null; }
+      if (this.observerRetryTimer) { clearTimeout(this.observerRetryTimer); this.observerRetryTimer = null; }
+      this._cancelInitialCapture();
+      this._cancelPendingChangeCheck();
+      this.queuedSnapshot = null;
+      this._clearSendRetry();
 
       // Immediately update dot to OFF so user sees instant feedback
       window.dispatchEvent(new CustomEvent("shadowwrite-tracking-state", {
@@ -508,6 +687,9 @@
           case "settingsChanged":
             if (message.settings) {
               Object.assign(this.settings, message.settings);
+              this.settings.contextMode = "off";
+              this._contextMode = "off";
+              this._teardownHiddenInject();
               console.log("[ShadowWrite] Settings updated:", this.settings);
             }
             break;
@@ -533,13 +715,9 @@
 
           // Context mode changed from popup
           case "setContextMode": {
-            const newMode = message.mode || "off";
-            this._contextMode = newMode;
-            if (newMode === "inject" && this.isTracking) {
-              this._setupHiddenInject();
-            } else {
-              this._teardownHiddenInject();
-            }
+            this.settings.contextMode = "off";
+            this._contextMode = "off";
+            this._teardownHiddenInject();
             sendResponse({ ok: true });
             break;
           }
@@ -607,12 +785,17 @@
      * Fetch the latest context content from server.
      */
     async _fetchContext() {
-      if (!this.currentConversationId) return "";
+      const conversationId = this.currentConversationId;
+      if (!conversationId) {
+        this._contextContent = "";
+        return "";
+      }
       try {
         const resp = await chrome.runtime.sendMessage({
           type: "getContext",
-          conversationId: this.currentConversationId,
+          conversationId,
         });
+        if (conversationId !== this.currentConversationId) return "";
         if (resp?.success && resp.data) {
           this._contextContent = resp.data.content || "";
           return this._contextContent;
@@ -621,6 +804,7 @@
         if (this._handleContextInvalidated(err)) return "";
         console.warn("[ShadowWrite] Failed to fetch context:", err.message);
       }
+      this._contextContent = "";
       return "";
     }
 
@@ -628,12 +812,11 @@
      * Extract context-update markers from AI response content
      * and post incremental updates to the server.
      */
-    async _extractAndSaveContextUpdates(messages) {
+    async _extractAndSaveContextUpdates(messages, conversationId = this.currentConversationId) {
       if (this._contextMode === "off") return;
-      if (!this.currentConversationId) return;
+      if (!conversationId) return;
 
-      const blocks = [];
-      const inlines = [];
+      const updates = [];
 
       for (const msg of messages) {
         if (msg.sender !== "AI") continue;
@@ -641,36 +824,86 @@
 
         // Block markers
         let match;
+        let markerIndex = 0;
         const blockRe = new RegExp(BaseShadowWriteAdapter._CONTEXT_BLOCK_RE.source, "g");
         while ((match = blockRe.exec(text)) !== null) {
-          blocks.push(match[1]);
+          const value = match[1].trim();
+          updates.push({
+            kind: "block",
+            value,
+            key: this._contextUpdateKey(msg.messageId, "block", markerIndex++, value),
+          });
         }
 
         // Inline markers (exclude those inside blocks)
         const textWithoutBlocks = text.replace(BaseShadowWriteAdapter._CONTEXT_BLOCK_RE, "");
+        markerIndex = 0;
         const inlineRe = new RegExp(BaseShadowWriteAdapter._CONTEXT_INLINE_RE.source, "g");
         while ((match = inlineRe.exec(textWithoutBlocks)) !== null) {
-          inlines.push(match[1]);
+          const value = match[1].trim();
+          updates.push({
+            kind: "inline",
+            value,
+            key: this._contextUpdateKey(msg.messageId, "inline", markerIndex++, value),
+          });
         }
       }
 
-      if (blocks.length === 0 && inlines.length === 0) return;
+      if (updates.length === 0) return;
+
+      const storageKey = `contextUpdateHistory:${conversationId}`;
+      let seen = new Set();
+      try {
+        const stored = await chrome.storage.local.get({ [storageKey]: [] });
+        seen = new Set(Array.isArray(stored[storageKey]) ? stored[storageKey] : []);
+      } catch (err) {
+        if (this._handleContextInvalidated(err)) return;
+        console.warn("[ShadowWrite] Failed to load context update history:", err.message);
+      }
+
+      const pending = updates.filter((update) => !seen.has(update.key));
+      if (pending.length === 0) return;
+
+      const blocks = pending
+        .filter((update) => update.kind === "block")
+        .map((update) => update.value);
+      const inlines = pending
+        .filter((update) => update.kind === "inline")
+        .map((update) => update.value);
 
       console.log(`[ShadowWrite] Extracted ${blocks.length} blocks, ${inlines.length} inline context updates`);
 
       try {
-        await chrome.runtime.sendMessage({
+        const resp = await chrome.runtime.sendMessage({
           type: "postContext",
           payload: {
-            conversationId: this.currentConversationId,
+            conversationId,
             blocks,
             inlines,
           },
+        });
+        if (!resp?.success) {
+          console.warn("[ShadowWrite] Context update was not saved:", resp?.error || resp?.data?.error);
+          return;
+        }
+
+        pending.forEach((update) => seen.add(update.key));
+        await chrome.storage.local.set({
+          [storageKey]: Array.from(seen).slice(-1000),
         });
       } catch (err) {
         if (this._handleContextInvalidated(err)) return;
         console.warn("[ShadowWrite] Failed to save context updates:", err.message);
       }
+    }
+
+    _contextUpdateKey(messageId, kind, index, value) {
+      let hash = 0x811c9dc5;
+      const text = String(value || "");
+      for (let i = 0; i < text.length; i++) {
+        hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
+      }
+      return `${messageId || "unknown"}:${kind}:${index}:${text.length}:${hash >>> 0}`;
     }
 
     /* ── Hidden inject: hook the submit button/Enter key ─────── */
@@ -734,56 +967,104 @@
       if (this._submitHooked) return;
       this._submitHooked = true;
 
-      this._origSubmitHandler = async (e) => {
+      this._origSubmitHandler = (e) => {
         // Only intercept Enter without Shift (most platforms send on Enter)
-        if (e.key !== "Enter" || e.shiftKey) return;
+        if (e.key !== "Enter" || e.shiftKey || e.isComposing) return;
+        if (this._bypassContextInject) return;
 
         const inputEl = this.getInputElement();
         if (!inputEl || inputEl !== e.target) return;
-        if (this._contextMode !== "inject") return;
-
-        const userText = this._getInputText(inputEl).trim();
-        if (!userText) return;
-
-        // Fetch latest context
-        await this._fetchContext();
-        if (!this._contextContent) return; // nothing to inject
-
-        // Prevent the original send
-        e.preventDefault();
-        e.stopImmediatePropagation();
-
-        const prefix = this._buildContextPrefix();
-        const fullText = `${prefix}\n\n---\n\n${userText}`;
-
-        // Set combined text and trigger send
-        this._setInputText(inputEl, fullText);
-
-        // Small delay to let the framework pick up the change, then click send
-        await new Promise((r) => setTimeout(r, 50));
-        const sendBtn = this.getSubmitButton();
-        if (sendBtn) {
-          sendBtn.click();
-        } else {
-          // Fallback: dispatch Enter event without our handler intercepting it
-          this._submitHooked = false; // temporarily unhook
-          inputEl.dispatchEvent(new KeyboardEvent("keydown", {
-            key: "Enter", code: "Enter", keyCode: 13, bubbles: true
-          }));
-          this._submitHooked = true;
-        }
+        this._interceptContextSubmit(e, inputEl);
       };
 
-      // Use capture phase to intercept before platform handlers
+      this._origSubmitClickHandler = (e) => {
+        if (this._bypassContextInject || e.button !== 0) return;
+        const sendBtn = this.getSubmitButton();
+        if (!sendBtn || (e.target !== sendBtn && !sendBtn.contains(e.target))) return;
+        const inputEl = this.getInputElement();
+        if (!inputEl) return;
+        this._interceptContextSubmit(e, inputEl);
+      };
+
       document.addEventListener("keydown", this._origSubmitHandler, true);
+      document.addEventListener("click", this._origSubmitClickHandler, true);
       console.log("[ShadowWrite] Hidden context inject hooked");
+    }
+
+    _interceptContextSubmit(event, inputEl) {
+      if (this._contextMode !== "inject") return false;
+
+      const userText = this._getInputText(inputEl).trim();
+      if (!userText) return false;
+
+      // Event dispatch does not await async listeners, so the page submission
+      // must be stopped before fetching context.
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (this._contextSubmitInFlight) return true;
+
+      this._submitWithContext(inputEl, userText);
+      return true;
+    }
+
+    async _submitWithContext(inputEl, userText) {
+      this._contextSubmitInFlight = true;
+      try {
+        await this._fetchContext();
+        if (!this._hasContextPrefix(userText)) {
+          const prefix = this._buildContextPrefix();
+          const fullText = `${prefix}\n\n---\n\n${userText}`;
+          this._setInputText(inputEl, fullText);
+        }
+
+        await new Promise((r) => setTimeout(r, 50));
+        this._bypassContextInject = true;
+        const sendBtn = this.getSubmitButton();
+        if (sendBtn && !sendBtn.disabled) {
+          sendBtn.click();
+        } else {
+          inputEl.dispatchEvent(new KeyboardEvent("keydown", {
+            key: "Enter",
+            code: "Enter",
+            keyCode: 13,
+            bubbles: true,
+            cancelable: true,
+          }));
+        }
+      } finally {
+        this._bypassContextInject = false;
+        this._contextSubmitInFlight = false;
+      }
+    }
+
+    _hasContextPrefix(text) {
+      const value = String(text || "");
+      return value.includes("=== PROJECT CONTEXT ===")
+        || value.includes("IMPORTANT: A persistent context file is attached to this session.");
+    }
+
+    _stripInjectedContextPrefix(content) {
+      const text = String(content || "").trim();
+      if (!this._hasContextPrefix(text)) return text;
+
+      const separator = /\n\s*\n---\n\s*\n/g;
+      let boundary = -1;
+      let match;
+      while ((match = separator.exec(text)) !== null) {
+        boundary = match.index + match[0].length;
+      }
+      return boundary >= 0 ? text.slice(boundary).trim() : text;
     }
 
     _teardownHiddenInject() {
       if (!this._submitHooked || !this._origSubmitHandler) return;
       document.removeEventListener("keydown", this._origSubmitHandler, true);
+      if (this._origSubmitClickHandler) {
+        document.removeEventListener("click", this._origSubmitClickHandler, true);
+      }
       this._submitHooked = false;
       this._origSubmitHandler = null;
+      this._origSubmitClickHandler = null;
     }
 
     /**
@@ -829,10 +1110,46 @@
         payload.title   = projectInfo.title;
       }
 
+      return this._sendPayloadToService(payload);
+    }
+
+    async _sendPayloadToService(payload) {
+      if (!payload || !payload.messages || payload.messages.length === 0) return false;
+
+      if (this.sendInFlight) {
+        // During streaming, keep only the newest full snapshot. Older queued
+        // snapshots would be overwritten by newer content anyway.
+        this.queuedSnapshot = payload;
+        return false;
+      }
+
+      this.sendInFlight = true;
+      let allDelivered = true;
+      let nextPayload = payload;
+      try {
+        while (nextPayload) {
+          this.queuedSnapshot = null;
+          const delivered = await this._deliverSnapshot(nextPayload);
+          if (!delivered) {
+            allDelivered = false;
+            const retryPayload = this.queuedSnapshot || nextPayload;
+            this.queuedSnapshot = null;
+            this._scheduleSendRetry(retryPayload);
+            break;
+          }
+          nextPayload = this.queuedSnapshot;
+        }
+      } finally {
+        this.sendInFlight = false;
+      }
+      return allDelivered;
+    }
+
+    async _deliverSnapshot(payload) {
       // Include per-conversation output directory if set
       try {
         const data = await chrome.storage.local.get({ convOutputDirs: {} });
-        const customDir = data.convOutputDirs[this.currentConversationId];
+        const customDir = data.convOutputDirs[payload.conversationId];
         if (customDir) {
           payload.outputDir = customDir;
         }
@@ -849,15 +1166,19 @@
 
         if (resp && resp.ok) {
           console.log(
-            `[ShadowWrite] Saved ${messages.length} messages → ${resp.body}`
+            `[ShadowWrite] Saved ${payload.messages.length} messages → ${resp.body}`
           );
           window.dispatchEvent(
             new CustomEvent("shadowwrite-save-success", {
-              detail: { count: messages.length },
+              detail: { count: payload.messages.length },
             })
           );
           // Extract context-update markers from AI responses
-          this._extractAndSaveContextUpdates(messages);
+          await this._extractAndSaveContextUpdates(payload.messages, payload.conversationId);
+          if (payload.conversationId === this.failedSnapshot?.conversationId) {
+            this._clearSendRetry();
+          }
+          return true;
         } else {
           const errMsg = resp?.error || `Server responded ${resp?.status}: ${resp?.body?.substring(0, 120)}`;
           console.warn(`[ShadowWrite] ${errMsg}`);
@@ -866,6 +1187,7 @@
               detail: { error: errMsg },
             })
           );
+          return false;
         }
       } catch (err) {
         if (this._handleContextInvalidated(err)) return;
@@ -875,7 +1197,35 @@
             detail: { error: err.message },
           })
         );
+        return false;
       }
+    }
+
+    _scheduleSendRetry(payload) {
+      if (!payload || !payload.conversationId || this._contextInvalidated) return;
+      if (!this.isTracking || payload.conversationId !== this.currentConversationId) return;
+
+      this.failedSnapshot = payload;
+      if (this.sendRetryTimer) return;
+
+      this.sendRetryTimer = setTimeout(() => {
+        this.sendRetryTimer = null;
+        const retryPayload = this.failedSnapshot;
+        if (!retryPayload) return;
+        if (!this.isTracking || retryPayload.conversationId !== this.currentConversationId) {
+          this._clearSendRetry();
+          return;
+        }
+        this._sendPayloadToService(retryPayload);
+      }, SEND_RETRY_DELAY);
+    }
+
+    _clearSendRetry() {
+      if (this.sendRetryTimer) {
+        clearTimeout(this.sendRetryTimer);
+        this.sendRetryTimer = null;
+      }
+      this.failedSnapshot = null;
     }
 
     /* -------------------------------------------------------------- */
@@ -890,18 +1240,57 @@
     }
 
     /**
+     * Build a compact change signature without allocating a huge JSON string.
+     * This still scans message text, but avoids the extra full-snapshot copy
+     * that becomes expensive in long conversations.
+     */
+    _buildSnapshotSignature(messages) {
+      let hashA = 0x811c9dc5;
+      let hashB = 0x45d9f3b;
+      let charCount = 0;
+
+      const update = (value) => {
+        const text = value == null ? "" : String(value);
+        charCount += text.length;
+        for (let i = 0; i < text.length; i++) {
+          const code = text.charCodeAt(i);
+          hashA = Math.imul(hashA ^ code, 0x01000193);
+          hashB = Math.imul(hashB + code, 0x27d4eb2d) ^ (hashB >>> 15);
+        }
+        hashA = Math.imul(hashA ^ 0x1f, 0x01000193);
+        hashB = Math.imul(hashB + 0x9e3779b9, 0x27d4eb2d) ^ (hashB >>> 15);
+      };
+
+      update(messages.length);
+      for (const msg of messages) {
+        update(msg.messageId);
+        update(msg.sender);
+        update(msg.position);
+        update(msg.content);
+        update(msg.thinking);
+      }
+
+      return `${messages.length}:${charCount}:${hashA >>> 0}:${hashB >>> 0}`;
+    }
+
+    /**
      * Extract content from an element and convert HTML to Markdown,
      * preserving headings, bold/italic, lists, code blocks, tables, etc.
      */
     extractFormattedContent(element) {
       if (!element) return "";
+      const cached = this._formatCache.get(element);
+      if (cached !== undefined) return cached;
+
       // Clone to avoid side effects
       const clone = element.cloneNode(true);
       // Remove hidden/script elements
       clone
         .querySelectorAll("script, style, .sr-only")
         .forEach((el) => el.remove());
-      return this._htmlToMarkdown(clone);
+      const markdown = this._htmlToMarkdown(clone);
+      this._formatCache.set(element, markdown);
+      return markdown;
     }
 
     /**
@@ -1113,6 +1502,16 @@
       return !!focused;
     }
 
+    isEditingMessage() {
+      const active = document.activeElement;
+      if (!active || active === document.body) return false;
+      const editable = active.matches?.("textarea, input, [contenteditable]")
+        ? active
+        : active.closest?.("textarea, input, [contenteditable]");
+      if (!editable) return false;
+      return this.isMessageElement(editable);
+    }
+
     /**
      * Cleanup on unload.
      */
@@ -1121,6 +1520,11 @@
       if (this.debounceTimer) clearTimeout(this.debounceTimer);
       if (this.throttleTimer) clearTimeout(this.throttleTimer);
       if (this.urlCheckInterval) clearInterval(this.urlCheckInterval);
+      if (this.observerRetryTimer) clearTimeout(this.observerRetryTimer);
+      this._cancelInitialCapture();
+      this._cancelPendingChangeCheck();
+      this.queuedSnapshot = null;
+      this._clearSendRetry();
     }
   }
 

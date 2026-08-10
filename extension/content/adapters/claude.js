@@ -91,18 +91,18 @@
     }
 
     extractMessages() {
-      if (this.isInEditMode(document.body)) return [];
-
       const messages = [];
       let position = 0;
 
       // querySelectorAll returns elements in DOM order — this correctly
       // interleaves user and AI messages.
       const allEls = document.querySelectorAll(
-        '[data-testid="user-message"], .font-claude-response'
+        '[data-testid="user-message"], [data-testid="assistant-message"], .font-claude-response'
       );
 
       allEls.forEach((el) => {
+        if (this.isInEditMode(el)) return;
+
         if (el.matches('[data-testid="user-message"]')) {
           messages.push({
             messageId: this.generateMessageId("user", position),
@@ -148,8 +148,10 @@
       if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
       return (
         node.matches?.('[data-testid="user-message"]') ||
+        node.matches?.('[data-testid="assistant-message"]') ||
         node.matches?.(".font-claude-response") ||
         node.closest?.('[data-testid="user-message"]') !== null ||
+        node.closest?.('[data-testid="assistant-message"]') !== null ||
         node.closest?.(".font-claude-response") !== null ||
         node.matches?.("[data-test-render-count]") ||
         node.closest?.("[data-test-render-count]") !== null

@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "ShadowWrite",
   "version": "0.1.0",
+  "version_name": "0.1.0+local.7b2c29f7daeb",
   "description": "Real-time AI chat → local Markdown persistence via local HTTP service.",
   "icons": {
     "16": "icons/icon16.png",
@@ -12,6 +13,7 @@
     "storage",
     "tabs",
     "contextMenus",
+    "alarms",
     "activeTab",
     "scripting"
   ],
@@ -81,7 +83,7 @@
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://kimi.moonshot.cn/*", "https://*.kimi.com/*"],
+      "matches": ["https://kimi.moonshot.cn/*", "https://kimi.com/*", "https://*.kimi.com/*"],
       "js": [
         "content/base-adapter.js",
         "content/content-common.js",

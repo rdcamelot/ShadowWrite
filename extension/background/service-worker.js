@@ -16,6 +16,113 @@ const DEFAULT_SETTINGS = {
   autoCapture: true,
   enabled: true,
 };
+const EXTENSION_UPDATE_ALARM = "shadowwrite-extension-update";
+const PENDING_RELOAD_TABS_KEY = "_shadowwritePendingReloadTabs";
+const EXTENSION_UPDATE_ATTEMPT_KEY = "_shadowwriteExtensionUpdateAttempt";
+const SUPPORTED_AI_PAGE = /^https:\/\/(?:chatgpt\.com|chat\.openai\.com|chat\.deepseek\.com|gemini\.google\.com|claude\.ai|grok\.com|kimi\.moonshot\.cn|kimi\.com|[^/]+\.kimi\.com|www\.doubao\.com|yuanbao\.tencent\.com)\//;
+
+let extensionUpdateCheckInFlight = null;
+
+function buildServerUrl(host, port, path, searchParams) {
+  let rawHost = String(host || DEFAULT_SETTINGS.host).trim();
+  if (!/^https?:\/\//i.test(rawHost)) {
+    rawHost = `http://${rawHost}`;
+  }
+
+  const url = new URL(rawHost);
+  if (port !== undefined && port !== null && port !== "") {
+    url.port = String(port || DEFAULT_SETTINGS.port);
+  } else if (!url.port) {
+    url.port = String(DEFAULT_SETTINGS.port);
+  }
+  url.pathname = path;
+  url.search = "";
+
+  if (searchParams) {
+    for (const [key, value] of Object.entries(searchParams)) {
+      if (value !== undefined && value !== null) {
+        url.searchParams.set(key, value);
+      }
+    }
+  }
+  return url.toString();
+}
+
+function getLoadedExtensionVersion() {
+  const manifest = chrome.runtime.getManifest();
+  return manifest.version_name || manifest.version;
+}
+
+function ensureExtensionUpdateAlarm() {
+  chrome.alarms.create(EXTENSION_UPDATE_ALARM, { periodInMinutes: 1 });
+}
+
+async function finishPendingExtensionReload() {
+  const stored = await chrome.storage.local.get({ [PENDING_RELOAD_TABS_KEY]: [] });
+  const tabIds = stored[PENDING_RELOAD_TABS_KEY];
+  if (!Array.isArray(tabIds) || tabIds.length === 0) return;
+
+  await chrome.storage.local.remove(PENDING_RELOAD_TABS_KEY);
+  for (const tabId of tabIds) {
+    try {
+      await chrome.tabs.reload(tabId);
+    } catch {
+      // The tab may have been closed while the extension was reloading.
+    }
+  }
+}
+
+function checkForExtensionUpdate() {
+  if (extensionUpdateCheckInFlight) return extensionUpdateCheckInFlight;
+
+  extensionUpdateCheckInFlight = (async () => {
+    try {
+      const settings = await chrome.storage.sync.get(DEFAULT_SETTINGS);
+      const response = await fetch(buildServerUrl(
+        settings.host,
+        settings.port,
+        "/api/health",
+      ), { signal: AbortSignal.timeout(3000) });
+      if (!response.ok) return;
+
+      const health = await response.json();
+      const availableVersion = health.extensionVersionName || health.extensionVersion;
+      const loadedVersion = getLoadedExtensionVersion();
+      if (!availableVersion || availableVersion === "unknown" || availableVersion === loadedVersion) {
+        if (availableVersion === loadedVersion) {
+          await chrome.storage.local.remove(EXTENSION_UPDATE_ATTEMPT_KEY);
+        }
+        return;
+      }
+
+      const stored = await chrome.storage.local.get({ [EXTENSION_UPDATE_ATTEMPT_KEY]: null });
+      const previousAttempt = stored[EXTENSION_UPDATE_ATTEMPT_KEY];
+      if (
+        previousAttempt?.loadedVersion === loadedVersion &&
+        previousAttempt?.availableVersion === availableVersion
+      ) {
+        return;
+      }
+
+      const tabs = await chrome.tabs.query({});
+      const reloadTabIds = tabs
+        .filter((tab) => tab.id && SUPPORTED_AI_PAGE.test(tab.url || ""))
+        .map((tab) => tab.id);
+      await chrome.storage.local.set({
+        [PENDING_RELOAD_TABS_KEY]: reloadTabIds,
+        [EXTENSION_UPDATE_ATTEMPT_KEY]: { loadedVersion, availableVersion },
+      });
+      console.log(`[ShadowWrite] Reloading extension ${loadedVersion} -> ${availableVersion}`);
+      chrome.runtime.reload();
+    } catch {
+      // The local server may be offline; retry on the next alarm.
+    }
+  })().finally(() => {
+    extensionUpdateCheckInFlight = null;
+  });
+
+  return extensionUpdateCheckInFlight;
+}
 
 // ── Clip tracking persistence (chrome.storage.session) ───────────
 // Survives MV3 service worker restarts within the browser session.
@@ -50,13 +157,32 @@ chrome.runtime.onInstalled.addListener(async (details) => {
     console.log("[ShadowWrite] Extension installed, defaults saved.");
   }
 
+  await chrome.contextMenus.removeAll();
   // Context menu for web clipping (hidden feature — no UI mention)
   chrome.contextMenus.create({
     id: "shadowwrite-clip",
     title: "剪藏到 ShadowWrite",
     contexts: ["page", "selection"],
   });
+  ensureExtensionUpdateAlarm();
+  checkForExtensionUpdate();
 });
+
+chrome.runtime.onStartup.addListener(() => {
+  ensureExtensionUpdateAlarm();
+  finishPendingExtensionReload();
+  checkForExtensionUpdate();
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === EXTENSION_UPDATE_ALARM) {
+    checkForExtensionUpdate();
+  }
+});
+
+ensureExtensionUpdateAlarm();
+finishPendingExtensionReload();
+checkForExtensionUpdate();
 
 // ── Clip helper: inject clipper.js → POST /api/clip ──────────────
 async function doClipTab(tabId, overrideGroup) {
@@ -74,7 +200,7 @@ async function doClipTab(tabId, overrideGroup) {
     }
     const group = overrideGroup || data.group || "";
     const s = await chrome.storage.sync.get(DEFAULT_SETTINGS);
-    const url = `http://${s.host}:${s.port}/api/clip`;
+    const url = buildServerUrl(s.host, s.port, "/api/clip");
     const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -161,15 +287,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case "sendToServer":
       (async () => {
         try {
-          let host = message.host || "http://127.0.0.1";
-          if (!/^https?:\/\//i.test(host)) {
-            host = `http://${host}`;
-          }
-          const url = `${host}:${message.port || 24601}/api/messages`;
+          const url = buildServerUrl(message.host, message.port, "/api/messages");
+          const timeoutMs = Number(message.timeoutMs) || 15000;
           const resp = await fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(message.payload),
+            signal: AbortSignal.timeout(timeoutMs),
           });
           const body = await resp.text();
           sendResponse({ ok: resp.ok, status: resp.status, body });
@@ -184,13 +308,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       (async () => {
         try {
           const s = await chrome.storage.sync.get(DEFAULT_SETTINGS);
-          let url = `http://${s.host}:${s.port}/api/config`;
-          if (message.conversationId) {
-            url += `?conversationId=${encodeURIComponent(message.conversationId)}`;
-          }
+          const url = buildServerUrl(s.host, s.port, "/api/config", {
+            conversationId: message.conversationId,
+          });
           const resp = await fetch(url, { signal: AbortSignal.timeout(3000) });
           const data = await resp.json();
-          sendResponse({ success: true, data });
+          sendResponse({ success: resp.ok, data });
         } catch (err) {
           sendResponse({ success: false, error: err.message });
         }
@@ -202,7 +325,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       (async () => {
         try {
           const s = await chrome.storage.sync.get(DEFAULT_SETTINGS);
-          const url = `http://${s.host}:${s.port}/api/config`;
+          const url = buildServerUrl(s.host, s.port, "/api/config");
           const resp = await fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -221,7 +344,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       (async () => {
         try {
           const s = await chrome.storage.sync.get(DEFAULT_SETTINGS);
-          const url = `http://${s.host}:${s.port}/api/browse-directory`;
+          const url = buildServerUrl(s.host, s.port, "/api/browse-directory");
           const body = message.initialDir ? JSON.stringify({ initialDir: message.initialDir }) : "{}";
           const resp = await fetch(url, {
             method: "POST",
@@ -242,10 +365,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       (async () => {
         try {
           const s = await chrome.storage.sync.get(DEFAULT_SETTINGS);
-          const url = `http://${s.host}:${s.port}/api/context?conversationId=${encodeURIComponent(message.conversationId)}`;
+          const url = buildServerUrl(s.host, s.port, "/api/context", {
+            conversationId: message.conversationId,
+          });
           const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
           const data = await resp.json();
-          sendResponse({ success: true, data });
+          sendResponse({ success: resp.ok, data });
         } catch (err) {
           sendResponse({ success: false, error: err.message });
         }
@@ -256,7 +381,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       (async () => {
         try {
           const s = await chrome.storage.sync.get(DEFAULT_SETTINGS);
-          const url = `http://${s.host}:${s.port}/api/context`;
+          const url = buildServerUrl(s.host, s.port, "/api/context");
           const resp = await fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -274,7 +399,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       (async () => {
         try {
           const s = await chrome.storage.sync.get(DEFAULT_SETTINGS);
-          const url = `http://${s.host}:${s.port}/api/context/summarize`;
+          const url = buildServerUrl(s.host, s.port, "/api/context/summarize");
           const resp = await fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -310,8 +435,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           if (message.enabled) {
             // Clip immediately
             const result = await doClipTab(tTabId);
+            if (!result?.ok) {
+              sendResponse(result || { ok: false, error: "Initial clip failed" });
+              return;
+            }
             // Store tracking state with group from first clip
-            const [curTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+            const curTab = await chrome.tabs.get(tTabId);
             await setClipTab(tTabId, {
               lastUrl: curTab?.url || "",
               group: result?.group || "",

@@ -33,14 +33,21 @@
     }
 
     extractMessages() {
-      if (this.isInEditMode(document.body)) return [];
-
       const messages = [];
-      const items = document.querySelectorAll('[data-testid="union_message"]');
+      const wrappedItems = document.querySelectorAll('[data-testid="union_message"]');
+      const items = wrappedItems.length > 0
+        ? wrappedItems
+        : document.querySelectorAll(
+            '[data-testid="send_message"], [data-testid="receive_message"]'
+          );
 
       items.forEach((item, index) => {
+        if (this.isInEditMode(item)) return;
+
         // User message
-        const sendEl = item.querySelector('[data-testid="send_message"]');
+        const sendEl = item.matches('[data-testid="send_message"]')
+          ? item
+          : item.querySelector('[data-testid="send_message"]');
         if (sendEl) {
           const textEl = sendEl.querySelector(
             '[data-testid="message_text_content"]'
@@ -57,7 +64,9 @@
         }
 
         // AI message
-        const recvEl = item.querySelector('[data-testid="receive_message"]');
+        const recvEl = item.matches('[data-testid="receive_message"]')
+          ? item
+          : item.querySelector('[data-testid="receive_message"]');
         if (recvEl) {
           // Thinking content
           let thinking = "";
@@ -104,7 +113,9 @@
       if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
       return (
         node.matches?.('[data-testid="union_message"]') ||
-        node.closest?.('[data-testid="union_message"]') !== null
+        node.matches?.('[data-testid="send_message"], [data-testid="receive_message"]') ||
+        node.closest?.('[data-testid="union_message"]') !== null ||
+        node.closest?.('[data-testid="send_message"], [data-testid="receive_message"]') !== null
       );
     }
   }

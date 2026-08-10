@@ -35,50 +35,58 @@
     }
 
     extractMessages() {
-      if (this.isInEditMode(document.body)) return [];
-
       const messages = [];
-      const articles = document.querySelectorAll("article");
+      const articles = Array.from(document.querySelectorAll("article"))
+        .filter((article) => article.querySelector('[data-message-author-role]'));
 
       articles.forEach((article, index) => {
+        if (this.isInEditMode(article)) return;
+
         const userEl = article.querySelector(
-          'div[data-message-author-role="user"]'
+          '[data-message-author-role="user"]'
         );
         const assistantEl = article.querySelector(
-          'div[data-message-author-role="assistant"]'
+          '[data-message-author-role="assistant"]'
         );
 
-        if (userEl) {
-          const textEl = userEl.querySelector(".whitespace-pre-wrap");
-          if (textEl) {
-            messages.push({
-              messageId: this.generateMessageId("user", index),
-              sender: "user",
-              content: this.extractFormattedContent(textEl),
-              thinking: "",
-              position: index,
-            });
-          }
-        }
-
-        if (assistantEl) {
-          const proseEl = assistantEl.querySelector(".markdown.prose");
-          const content = proseEl
-            ? this.extractFormattedContent(proseEl)
-            : this.extractFormattedContent(assistantEl);
-          if (content) {
-            messages.push({
-              messageId: this.generateMessageId("AI", index),
-              sender: "AI",
-              content,
-              thinking: "",
-              position: index,
-            });
-          }
-        }
+        if (userEl) this._appendRoleMessage(messages, userEl, "user", index);
+        if (assistantEl) this._appendRoleMessage(messages, assistantEl, "AI", index);
       });
 
+      if (articles.length === 0) {
+        const roleElements = Array.from(document.querySelectorAll(
+          '[data-message-author-role="user"], [data-message-author-role="assistant"]'
+        )).filter((element) => !element.parentElement?.closest('[data-message-author-role]'));
+
+        roleElements.forEach((element, index) => {
+          if (this.isInEditMode(element)) return;
+          const role = element.getAttribute("data-message-author-role") === "user"
+            ? "user"
+            : "AI";
+          this._appendRoleMessage(messages, element, role, index);
+        });
+      }
+
       return messages;
+    }
+
+    _appendRoleMessage(messages, element, role, position) {
+      const contentElement = role === "user"
+        ? element.querySelector('.whitespace-pre-wrap, .markdown, [data-testid="message-content"]') || element
+        : element.querySelector('.markdown.prose, .markdown, [data-testid="message-content"]') || element;
+      const extracted = this.extractFormattedContent(contentElement).trim();
+      const content = role === "user"
+        ? this._stripInjectedContextPrefix(extracted)
+        : extracted;
+      if (!content) return;
+
+      messages.push({
+        messageId: this.generateMessageId(role, position),
+        sender: role,
+        content,
+        thinking: "",
+        position,
+      });
     }
 
     isMessageElement(node) {

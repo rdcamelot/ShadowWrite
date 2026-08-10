@@ -32,19 +32,40 @@
     }
 
     extractMessages() {
-      if (this.isInEditMode(document.body)) return [];
-
       const messages = [];
       let position = 0;
 
       // querySelectorAll returns in DOM order — correctly interleaves
-      const allItems = document.querySelectorAll(
+      const legacyItems = document.querySelectorAll(
         ".agent-chat__list__item--human, .agent-chat__list__item--ai"
       );
+      const roleSelector = [
+        '[data-message-author-role="user"]',
+        '[data-message-author-role="assistant"]',
+        '[data-role="user"]',
+        '[data-role="assistant"]',
+        '[data-testid="user-message"]',
+        '[data-testid="assistant-message"]',
+      ].join(", ");
+      const allItems = legacyItems.length > 0
+        ? Array.from(legacyItems)
+        : Array.from(document.querySelectorAll(roleSelector))
+            .filter((element) => !element.parentElement?.closest(roleSelector));
 
       allItems.forEach((item) => {
-        if (item.matches(".agent-chat__list__item--human")) {
-          const textEl = item.querySelector(".hyc-content-text");
+        if (this.isInEditMode(item)) return;
+        const marker = [
+          item.getAttribute("data-message-author-role"),
+          item.getAttribute("data-role"),
+          item.getAttribute("data-testid"),
+        ].filter(Boolean).join(" ").toLowerCase();
+        const isUser = item.matches(".agent-chat__list__item--human")
+          || /user|human/.test(marker);
+
+        if (isUser) {
+          const textEl = item.querySelector(
+            '.hyc-content-text, [data-testid="message-content"], .whitespace-pre-wrap'
+          ) || item;
           if (textEl) {
             messages.push({
               messageId: this.generateMessageId("user", position),
@@ -58,28 +79,36 @@
           // AI message
           let thinking = "";
           const thinkEl = item.querySelector(
-            ".hyc-component-reasoner__think-content"
+            '.hyc-component-reasoner__think-content, [data-testid="thinking-content"]'
           );
           if (thinkEl) {
             const thinkText = thinkEl.querySelector(
-              ".hyc-component-reasoner__text"
-            );
-            if (thinkText) {
-              thinking = this.extractFormattedContent(thinkText);
-            }
+              '.hyc-component-reasoner__text, [data-testid="message-content"]'
+            ) || thinkEl;
+            thinking = this.extractFormattedContent(thinkText);
           }
 
           // Main response text
-          const responseEl = item.querySelector(
-            ".hyc-component-reasoner__text"
-          );
           let content = "";
-          if (responseEl && !responseEl.closest(".hyc-component-reasoner__think-content")) {
-            content = this.extractFormattedContent(responseEl);
+          const responseEls = item.querySelectorAll(
+            '.hyc-component-reasoner__text, [data-testid="message-content"], .markdown, .prose'
+          );
+          for (const responseEl of responseEls) {
+            if (
+              !responseEl.closest(".hyc-component-reasoner__think-content") &&
+              !responseEl.closest('[data-testid="thinking-content"]')
+            ) {
+              content = this.extractFormattedContent(responseEl);
+              break;
+            }
           }
-          // Fallback: direct extraction from AI item
+
           if (!content) {
-            content = this.extractFormattedContent(item);
+            const clone = item.cloneNode(true);
+            clone.querySelectorAll(
+              '.hyc-component-reasoner__think-content, [data-testid="thinking-content"], button, [role="toolbar"]'
+            ).forEach((node) => node.remove());
+            content = this.extractFormattedContent(clone);
           }
 
           if (content) {
@@ -102,8 +131,10 @@
       return (
         node.matches?.(".agent-chat__list__item--human") ||
         node.matches?.(".agent-chat__list__item--ai") ||
+        node.matches?.('[data-message-author-role="user"], [data-message-author-role="assistant"], [data-role="user"], [data-role="assistant"], [data-testid="user-message"], [data-testid="assistant-message"]') ||
         node.closest?.(".agent-chat__list__item--human") !== null ||
-        node.closest?.(".agent-chat__list__item--ai") !== null
+        node.closest?.(".agent-chat__list__item--ai") !== null ||
+        node.closest?.('[data-message-author-role="user"], [data-message-author-role="assistant"], [data-role="user"], [data-role="assistant"], [data-testid="user-message"], [data-testid="assistant-message"]') !== null
       );
     }
   }

@@ -31,15 +31,19 @@
     }
 
     extractMessages() {
-      if (this.isInEditMode(document.body)) return [];
-
       const messages = [];
       let position = 0;
 
       // querySelectorAll returns in DOM order — correctly interleaves
       const allEls = document.querySelectorAll("._9663006, ._4f9bf79._43c05b5");
 
+      if (allEls.length === 0) {
+        return this._extractRoleMarkedMessages();
+      }
+
       allEls.forEach((el) => {
+        if (this.isInEditMode(el)) return;
+
         if (el.matches("._9663006")) {
           // User message
           const textEl = el.querySelector(".fbb737a4");
@@ -87,13 +91,61 @@
       return messages;
     }
 
+    _extractRoleMarkedMessages() {
+      const selector = [
+        '[data-message-author-role="user"]',
+        '[data-message-author-role="assistant"]',
+        '[data-role="user"]',
+        '[data-role="assistant"]',
+        '[data-testid="user-message"]',
+        '[data-testid="assistant-message"]',
+      ].join(", ");
+      const elements = Array.from(document.querySelectorAll(selector))
+        .filter((element) => !element.parentElement?.closest(selector));
+
+      return elements.map((element, index) => {
+        if (this.isInEditMode(element)) return null;
+        const marker = [
+          element.getAttribute("data-message-author-role"),
+          element.getAttribute("data-role"),
+          element.getAttribute("data-testid"),
+        ].filter(Boolean).join(" ").toLowerCase();
+        const sender = /user|human/.test(marker) ? "user" : "AI";
+        const thinkEl = element.querySelector(
+          '.ds-think-content, [data-testid="thinking-content"]'
+        );
+        const thinking = thinkEl
+          ? this.extractFormattedContent(thinkEl).trim()
+          : "";
+        const clone = element.cloneNode(true);
+        clone.querySelectorAll(
+          '.ds-think-content, [data-testid="thinking-content"], button, [role="toolbar"]'
+        ).forEach((node) => node.remove());
+        const contentEl = clone.querySelector(
+          '.ds-markdown, [data-testid="message-content"], .markdown, .prose, .whitespace-pre-wrap'
+        ) || clone;
+        const content = this.extractFormattedContent(contentEl).trim();
+        if (!content) return null;
+
+        return {
+          messageId: this.generateMessageId(sender, index),
+          sender,
+          content,
+          thinking,
+          position: index,
+        };
+      }).filter(Boolean);
+    }
+
     isMessageElement(node) {
       if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
       return (
         node.matches?.("._9663006") ||
         node.matches?.("._4f9bf79") ||
+        node.matches?.('[data-message-author-role="user"], [data-message-author-role="assistant"], [data-role="user"], [data-role="assistant"], [data-testid="user-message"], [data-testid="assistant-message"]') ||
         node.closest?.("._9663006") !== null ||
-        node.closest?.("._4f9bf79") !== null
+        node.closest?.("._4f9bf79") !== null ||
+        node.closest?.('[data-message-author-role="user"], [data-message-author-role="assistant"], [data-role="user"], [data-role="assistant"], [data-testid="user-message"], [data-testid="assistant-message"]') !== null
       );
     }
   }

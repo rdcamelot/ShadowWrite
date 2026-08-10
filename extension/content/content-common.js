@@ -25,14 +25,14 @@
     dot.id = STATUS_ID;
     dot.title = "ShadowWrite: click to toggle tracking";
 
-    // Keep host-page handlers from treating the indicator as Gemini UI.
+    // Keep host-page handlers from treating the indicator as page UI.
     for (const eventName of ["pointerdown", "pointerup", "mousedown", "mouseup"]) {
-      dot.addEventListener(eventName, (event) => {
-        event.stopPropagation();
-      });
+      dot.addEventListener(eventName, (event) => event.stopPropagation(), true);
+      dot.addEventListener(eventName, (event) => event.stopPropagation());
     }
 
-    // Click to toggle tracking on/off for current conversation
+    // Click to toggle tracking on/off for current conversation. Use capture
+    // phase so the handler still runs while the event is isolated from hosts.
     dot.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -54,7 +54,7 @@
       } else {
         adapter.enableTracking();
       }
-    });
+    }, true);
 
     document.body.appendChild(dot);
   }
