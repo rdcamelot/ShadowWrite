@@ -15,7 +15,7 @@ function eventHook() {
   return { addListener() {} };
 }
 
-function createChromeMock({ loadedVersion, localState, reloadCalls, tabReloads }) {
+function createChromeMock({ loadedVersion, localState, reloadCalls, tabReloads, clipData, sessionState }) {
   return {
     runtime: {
       getManifest: () => ({ version: "0.1.0", version_name: loadedVersion }),
@@ -36,8 +36,8 @@ function createChromeMock({ loadedVersion, localState, reloadCalls, tabReloads }
         remove: async (key) => { delete localState[key]; },
       },
       session: {
-        get: async (defaults) => ({ ...(defaults || {}) }),
-        set: async () => {},
+        get: async (defaults) => ({ ...(defaults || {}), ...sessionState }),
+        set: async (values) => Object.assign(sessionState, values),
       },
       onChanged: eventHook(),
     },
@@ -64,7 +64,7 @@ function createChromeMock({ loadedVersion, localState, reloadCalls, tabReloads }
       setBadgeText() {},
       setBadgeBackgroundColor() {},
     },
-    scripting: { executeScript: async () => [] },
+    scripting: { executeScript: async () => [{ result: clipData }] },
   };
 }
 
@@ -76,25 +76,38 @@ async function runWorker(loadedVersion, shared) {
     AbortSignal,
     setTimeout,
     clearTimeout,
-    fetch: async () => ({
-      ok: true,
-      json: async () => ({
-        service: "ShadowWrite",
-        extensionVersion: "0.1.0",
-        extensionVersionName: CURRENT_VERSION,
-      }),
-    }),
+    fetch: async (url, options) => {
+      if (new URL(url).pathname === "/api/clip") {
+        shared.clipRequests.push(JSON.parse(options.body));
+        return { ok: true, json: async () => ({ title: "Chapter One", path: "clip.md" }) };
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          service: "ShadowWrite",
+          extensionVersion: "0.1.0",
+          extensionVersionName: CURRENT_VERSION,
+        }),
+      };
+    },
     console,
   };
   vm.runInNewContext(SERVICE_WORKER, context, { filename: "service-worker.js" });
   await new Promise((resolve) => setTimeout(resolve, 30));
+  return context;
 }
 
 async function main() {
   const shared = {
     localState: {},
+    sessionState: { _clipTabs: { "11": { lastUrl: "https://example.com/book/1", group: "Old group" } } },
     reloadCalls: [],
     tabReloads: [],
+    clipRequests: [],
+    clipData: {
+      title: "Chapter One", url: "https://example.com/book/1",
+      domain: "example.com", content: "Chapter text", group: "Example Book", groupIsBook: true,
+    },
   };
 
   await runWorker("0.1.0+local.old", shared);
@@ -113,7 +126,7 @@ async function main() {
     throw new Error("the same failed version pair should not reload twice");
   }
 
-  await runWorker(CURRENT_VERSION, shared);
+  const currentWorker = await runWorker(CURRENT_VERSION, shared);
   if (shared.reloadCalls.length !== 1) {
     throw new Error("current extension version should not reload again");
   }
@@ -128,6 +141,26 @@ async function main() {
   }
 
   console.log("OK service-worker-extension-update");
+
+  await currentWorker.doClipTab(11, "Old chapter subtitle group");
+  if (shared.clipRequests[0]?.group !== "Example Book") {
+    throw new Error("current book name should override the old tracking group");
+  }
+  if (shared.sessionState._clipTabs["11"].group !== "Example Book") {
+    throw new Error("the identified book name should persist for subsequent chapter pages");
+  }
+  shared.clipData.group = "";
+  shared.clipData.groupIsBook = false;
+  await currentWorker.doClipTab(11, "Previous series");
+  if (shared.clipRequests[1]?.group !== "Previous series") {
+    throw new Error("tracking group should remain a fallback when no book is identified");
+  }
+  shared.clipData.group = "Chapter subtitle";
+  await currentWorker.doClipTab(11, "Previous series");
+  if (shared.clipRequests[2]?.group !== "Previous series") {
+    throw new Error("a guessed chapter subtitle must not replace the tracking group");
+  }
+  console.log("OK service-worker-clip-book-group");
 }
 
 main().catch((error) => {

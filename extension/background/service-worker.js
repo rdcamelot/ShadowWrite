@@ -198,7 +198,9 @@ async function doClipTab(tabId, overrideGroup) {
       setTimeout(() => setBadge(tabId, "", "#ef4444"), 5000);
       return { ok: false, error: data?.error || "Extraction failed" };
     }
-    const group = overrideGroup || data.group || "";
+    const group = data.groupIsBook && data.group
+      ? data.group
+      : overrideGroup || data.group || "";
     const s = await chrome.storage.sync.get(DEFAULT_SETTINGS);
     const url = buildServerUrl(s.host, s.port, "/api/clip");
     const resp = await fetch(url, {
@@ -215,6 +217,10 @@ async function doClipTab(tabId, overrideGroup) {
     });
     if (resp.ok) {
       const body = await resp.json();
+      if (data.groupIsBook && group !== overrideGroup) {
+        const tracking = await getClipTab(tabId);
+        if (tracking) await setClipTab(tabId, { ...tracking, group });
+      }
       console.log("[ShadowWrite] Clipped:", body.title, "→", body.path);
       setBadge(tabId, "📎", "#3b82f6");
       setTimeout(() => setBadge(tabId, "", "#3b82f6"), 3000);

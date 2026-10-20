@@ -69,9 +69,12 @@ function runCase(chrome, testCase) {
     "--disable-gpu-sandbox",
     "--disable-software-rasterizer",
     "--disable-dev-shm-usage",
+    "--disable-background-networking",
+    "--no-proxy-server",
+    "--host-resolver-rules=MAP * ~NOTFOUND",
     "--disable-features=UseSkiaRenderer,VizDisplayCompositor",
     "--no-sandbox",
-    "--single-process",
+    `--user-data-dir=${path.join(TMP_DIR, "browser-profile")}`,
     "--no-first-run",
     "--no-default-browser-check",
     ...(testCase.virtualTimeBudget ? [`--virtual-time-budget=${testCase.virtualTimeBudget}`] : []),
@@ -96,6 +99,23 @@ function runCase(chrome, testCase) {
   const messages = JSON.parse(decodeURIComponent(match[1]));
   testCase.assert(messages);
   console.log(`OK ${testCase.name}: ${messages.length} message(s)`);
+}
+
+function buildClipHtml(title) {
+  const clipper = inlineScript(path.join(ROOT, "extension", "content", "clipper.js"));
+  return `<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>${title}</title></head>
+<body>
+<article><p>${"A sample chapter paragraph. ".repeat(12)}</p></article>
+<script>
+const clip = ${clipper};
+document.body.setAttribute("data-result", encodeURIComponent(JSON.stringify([
+  { content: JSON.stringify(clip) }
+])));
+</script>
+</body>
+</html>`;
 }
 
 function buildRetryHtml() {
@@ -580,6 +600,26 @@ function assertExcludes(value, unexpected, label) {
 function main() {
   const chrome = findChrome();
   const cases = [
+    ...[
+      "第一章：地震_Example Book-Example Site (EXAMPLE.COM)",
+      "第二章：集合_Example Book-Example Site (EXAMPLE.COM)",
+      "第三章：点名_Example Book",
+      "第四章：续篇_Example Book（上）",
+      "第五章：终篇_Example Book（下）",
+    ].map((title, index) => ({
+      name: `clip-chapter-book-group-${index + 1}`,
+      html: buildClipHtml(title),
+      assert(messages) {
+        const clip = JSON.parse(messages[0].content);
+        if (clip.error) throw new Error(clip.error);
+        if (clip.group !== "Example Book") {
+          throw new Error(`expected stable book group, got ${JSON.stringify(clip.group)}`);
+        }
+        if (!clip.groupIsBook) throw new Error("expected explicit book title detection");
+        assertIncludes(clip.title, "Example Book", "chapter title retains book name");
+        assertIncludes(clip.content, "sample chapter", "clip body");
+      },
+    })),
     {
       name: "gemini-conversation-container",
       html: buildHtml("gemini", `

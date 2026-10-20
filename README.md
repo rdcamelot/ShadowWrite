@@ -95,6 +95,8 @@ python shadowwrite_server.py
 
 > **网页剪藏（实验）**：在普通网页右键选择“剪藏到 ShadowWrite”，或打开扩展把“当前网页连续剪藏”打开。首次会立即保存正文，开启“页面变化时自动剪藏”后，章节/页面 URL 变化会继续写入 `outputs/clips/`。正文提取优先使用已知站点选择器，再降级到选区、`article/main` 和段落评分。
 
+> **章节分组与去重**：对于“第 N 章：章节名_书名”这类标题，章节按书名保存到同一个目录；页面能识别出书名时优先使用当前书名。同一来源 URL 的相同正文重复剪藏会跳过（日志显示 `skipped`），重启服务后仍有效；正文变化或翻页 URL 不同则保留新增内容。
+
 **第四步：查看输出**
 
 ```
@@ -267,7 +269,7 @@ python shadowwrite_cli.py --no-record --context-file auto
 - `GET  /api/config` — 读取运行时配置；附 `?conversationId=` 可获取该对话的实际输出目录及是否使用自定义路径
 - `POST /api/config` — 热更新配置：不传 `conversationId` 时修改全局目录/Chat HTML；传入 `conversationId` 时设置对话级自定义目录，服务器自动迁移已有文件（`outputDir: null` 重置回全局）
 - `POST /api/browse-directory` — 在服务器端弹出原生目录选择对话框，返回所选路径
-- `POST /api/clip` — 创建网页剪藏；相同站点和标题再次提交时追加内容
+- `POST /api/clip` — 创建网页剪藏；同一来源与正文重复提交时跳过，新增正文继续追加
 - `GET/POST /api/context` — 读取或更新当前对话的 `.context.md`
 - `POST /api/context/summarize` — 用已配置模型合并已有 context 与近期对话，生成完整替代摘要
 - 线程安全，`messageId` 幂等去重，CORS 支持

@@ -291,6 +291,7 @@
    */
   function extractGroup(title) {
     let work = title;
+    let isBook = false;
 
     // Leading chapter/volume markers
     const leadingPatterns = [
@@ -302,8 +303,19 @@
       /^\d+[\s.、:：]+/,
     ];
 
+    // Chapter subtitles vary; the suffix in "Chapter: subtitle_Book" is the
+    // stable series name. Keep underscores inside the book name intact.
+    const bookSeparator = title.indexOf("_");
+    if (bookSeparator >= 0 && leadingPatterns.some((pattern) => pattern.test(title))) {
+      const book = title.slice(bookSeparator + 1).trim();
+      if (book.length >= 2) {
+        work = book;
+        isBook = true;
+      }
+    }
+
     let changed = true;
-    while (changed) {
+    while (changed && !isBook) {
       changed = false;
       for (const pat of leadingPatterns) {
         const before = work;
@@ -328,7 +340,7 @@
       .trim();
 
     if (work && work !== title.trim() && work.length >= 2) {
-      return work;
+      return { name: work, isBook };
     }
     return null;
   }
@@ -352,15 +364,17 @@
     // Derive a clean title
     let title = document.title || "";
     // Strip common suffixes: "xxx - Site Name", "xxx | Site Name"
-    title = title.replace(/\s*[|\-–—_]\s*[^|\-–—_]+$/, "").trim();
+    title = title.replace(/\s*[|\-–—]\s*[^|\-–—_]+$/, "").trim();
     if (!title) title = "Untitled";
+    const group = extractGroup(title);
 
     return {
       title: title,
       url: location.href,
       domain: location.hostname,
       content: markdown,
-      group: extractGroup(title) || "",
+      group: group?.name || "",
+      groupIsBook: group?.isBook || false,
     };
   } catch (err) {
     return { error: err.message };

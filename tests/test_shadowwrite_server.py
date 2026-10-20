@@ -236,6 +236,106 @@ class ShadowWriteServerTests(unittest.TestCase):
         self.assertEqual(content.count("First captured body."), 1)
         self.assertEqual(content.count("Second captured body."), 1)
 
+    def test_web_clip_repeated_snapshots_are_skipped_after_restart(self):
+        payload = {
+            "title": "Chapter One",
+            "url": "https://example.test/book/1",
+            "domain": "example.test",
+            "group": "Example Book",
+            "content": "First captured body.",
+        }
+        created = self.request_json("/api/clip", payload)
+        clip_path = Path(created["path"])
+        original = clip_path.read_bytes()
+        self.assertEqual(self.request_json("/api/clip", payload)["mode"], "skipped")
+        self.assertEqual(clip_path.read_bytes(), original)
+
+        payload["content"] = "Updated captured body."
+        self.assertEqual(self.request_json("/api/clip", payload)["mode"], "appended")
+        updated = clip_path.read_bytes()
+        self.restart_server()
+        for body in ("First captured body.", "Updated captured body."):
+            with self.subTest(body=body):
+                payload["content"] = body
+                self.assertEqual(self.request_json("/api/clip", payload)["mode"], "skipped")
+                self.assertEqual(clip_path.read_bytes(), updated)
+
+    def test_web_clip_legacy_snapshot_is_skipped(self):
+        clip_dir = Path(self.tmp.name) / "clips" / "example.test" / "Example Book"
+        clip_dir.mkdir(parents=True)
+        clip_path = clip_dir / "Chapter One.md"
+        legacy = (
+            "# Chapter One\n\n- Source: https://example.test/book/1\n"
+            "- Clipped: 2026-01-01 00:00:00\n- Domain: example.test\n\n---\n\n"
+            "Original legacy body.\n\n---\n\n"
+            "<!-- clip: appended at 2026-01-01 00:01:00 -->\n\nUpdated legacy body."
+        )
+        clip_path.write_text(legacy, encoding="utf-8")
+        original = clip_path.read_bytes()
+        result = self.request_json("/api/clip", {
+            "title": "Chapter One",
+            "url": "https://example.test/book/1",
+            "domain": "example.test",
+            "group": "Example Book",
+            "content": "Original legacy body.",
+        })
+        self.assertEqual(result["mode"], "skipped")
+        self.assertEqual(clip_path.read_bytes(), original)
+
+        # The old append marker has no URL, so preserve a new request rather
+        # than guess that its source was the header's URL.
+        result = self.request_json("/api/clip", {
+            "title": "Chapter One",
+            "url": "https://example.test/book/1",
+            "domain": "example.test",
+            "group": "Example Book",
+            "content": "Updated legacy body.",
+        })
+        self.assertEqual(result["mode"], "appended")
+
+    def test_web_clip_distinct_page_urls_preserve_identical_content(self):
+        payload = {
+            "title": "Chapter One",
+            "url": "https://example.test/book/1?page=1",
+            "domain": "example.test",
+            "group": "Example Book",
+            "content": "Shared page text.",
+        }
+        self.request_json("/api/clip", payload)
+        payload["url"] = "https://example.test/book/1?page=2"
+        result = self.request_json("/api/clip", payload)
+        self.assertEqual(result["mode"], "appended")
+        clip_path = Path(result["path"])
+        self.assertEqual(clip_path.read_text(encoding="utf-8").count("Shared page text."), 2)
+        self.assertEqual(self.request_json("/api/clip", payload)["mode"], "skipped")
+
+    def test_web_clip_fragment_pagination_is_preserved(self):
+        payload = {
+            "title": "Chapter One",
+            "url": "https://example.test/book/1#page=1",
+            "domain": "example.test",
+            "content": "Shared page text.",
+        }
+        self.request_json("/api/clip", payload)
+        payload["url"] = "https://example.test/book/1#page=2"
+        result = self.request_json("/api/clip", payload)
+        self.assertEqual(result["mode"], "appended")
+        self.assertEqual(Path(result["path"]).read_text(encoding="utf-8").count("Shared page text."), 2)
+        self.assertEqual(self.request_json("/api/clip", payload)["mode"], "skipped")
+
+    def test_web_clip_markdown_indentation_is_preserved(self):
+        payload = {
+            "title": "Chapter One",
+            "url": "https://example.test/book/1",
+            "domain": "example.test",
+            "content": "sample code",
+        }
+        self.request_json("/api/clip", payload)
+        payload["content"] = "    sample code"
+        result = self.request_json("/api/clip", payload)
+        self.assertEqual(result["mode"], "appended")
+        self.assertIn("\n\n    sample code", Path(result["path"]).read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

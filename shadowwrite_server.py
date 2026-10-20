@@ -947,12 +947,42 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
 
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+        # Persist snapshot identity with the clip so duplicate protection also
+        # survives restarts. Keep query strings and fragments for pagination.
+        source_url = url
+        normalized_content = content.replace("\r\n", "\n")
+        snapshot_hash = hashlib.sha256(json.dumps(
+            [source_url, normalized_content], ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        snapshot_marker = f"<!-- clip: snapshot={snapshot_hash} -->"
+
         if md_path.exists():
-            # Append mode — same title from same domain, append with separator
-            with md_path.open("a", encoding="utf-8") as fh:
-                fh.write(f"\n\n---\n\n<!-- clip: appended at {ts} -->\n\n")
-                fh.write(content)
-            mode = "appended"
+            existing = md_path.read_text(encoding="utf-8")
+            duplicate = snapshot_marker in existing
+
+            # Older clips identify only their first block's source. Appended
+            # legacy blocks cannot safely be attributed to that same URL.
+            header, separator, body = existing.partition("\n---\n\n")
+            legacy_source = next((
+                line.removeprefix("- Source: ")
+                for line in header.splitlines() if line.startswith("- Source: ")
+            ), None)
+            if not duplicate and separator and legacy_source == source_url:
+                blocks = re.split(
+                    r"\n\n---\n\n<!-- clip: appended at [^\n]+ -->\n\n", body,
+                )
+                duplicate = (
+                    not blocks[0].startswith("<!-- clip: snapshot=")
+                    and blocks[0] == normalized_content
+                )
+
+            if duplicate:
+                mode = "skipped"
+            else:
+                with md_path.open("a", encoding="utf-8") as fh:
+                    fh.write(f"\n\n---\n\n<!-- clip: appended at {ts} -->\n\n")
+                    fh.write(f"{snapshot_marker}\n\n{content}")
+                mode = "appended"
         else:
             # New file — write header + content
             header = (
@@ -962,7 +992,7 @@ class ShadowWriteHandler(BaseHTTPRequestHandler):
                 f"- Domain: {domain}\n\n"
                 "---\n\n"
             )
-            md_path.write_text(header + content, encoding="utf-8")
+            md_path.write_text(header + snapshot_marker + "\n\n" + content, encoding="utf-8")
             mode = "created"
 
         self.log_message(
